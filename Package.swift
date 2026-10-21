@@ -9,6 +9,7 @@ let package = Package(
         .library(name: "BigBangCore", targets: ["BigBangCore"]),
         .library(name: "BigBangNetworking", targets: ["BigBangNetworking"]),
         .library(name: "BigBangSelection", targets: ["BigBangSelection"]),
+        .executable(name: "BigBang", targets: ["BigBang"]),
         .executable(name: "BigBangFixture", targets: ["BigBangFixture"])
     ],
     dependencies: [.package(url: "https://github.com/MacPaw/OpenAI.git", exact: "0.5.2")],
@@ -16,6 +17,7 @@ let package = Package(
         .target(name: "BigBangCore", resources: [.process("Resources")]),
         .target(name: "BigBangSelection", dependencies: ["BigBangCore"]),
         .target(name: "BigBangNetworking", dependencies: ["BigBangCore", .product(name: "OpenAI", package: "OpenAI")]),
+        .executableTarget(name: "BigBang", dependencies: ["BigBangCore", "BigBangNetworking", "BigBangSelection"]),
         .target(name: "BigBangTestSupport", path: "Tests/Support"),
         .executableTarget(name: "BigBangFixture", dependencies: ["BigBangTestSupport"], path: "Tests/FixtureRunner"),
         .testTarget(name: "BigBangCoreTests", dependencies: ["BigBangCore"]),
