@@ -1,0 +1,6 @@
+# Vendor output keeps whitespace inside library strings and license quotations.
+Resources/Markdown/sticky.js whitespace=-blank-at-eol linguist-generated=true
+Resources/Markdown/sticky.js.LEGAL.txt whitespace=-blank-at-eol linguist-generated=true
+Resources/Markdown/THIRD-PARTY-LICENSES.txt whitespace=-blank-at-eol linguist-generated=true
+Resources/Markdown/katex.min.css linguist-vendored=true
+Resources/Markdown/fonts/* linguist-vendored=true
