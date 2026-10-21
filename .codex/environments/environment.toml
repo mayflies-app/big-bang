@@ -1,0 +1,10 @@
+version = 1
+name = "BigBang"
+
+[setup]
+script = ""
+
+[[actions]]
+name = "Run"
+icon = "run"
+command = "./scripts/app.py run"

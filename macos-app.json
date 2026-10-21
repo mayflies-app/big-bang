@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "product": "BigBang",
+  "appName": "BigBang",
+  "executable": "BigBang",
+  "bundleIdentifier": "app.mayfiles.BigBang",
+  "repository": "mayflies-app/big-bang",
+  "caskToken": "bigbang",
+  "description": "Process selected text with configurable AI prompts",
+  "minimumSystemVersion": "14.0",
+  "buildSystem": "swiftpm",
+  "architectures": [
+    "arm64",
+    "x86_64",
+    "universal"
+  ],
+  "versionFile": "VERSION",
+  "releaseAdapter": "scripts/app.py",
+  "paths": {
+    "sharedRelease": "scripts/lib/release",
+    "project": "BigBang.xcodeproj"
+  },
+  "packaging": {
+    "infoPlist": "Resources/Info.plist",
+    "resources": [
+      "LICENSE",
+      "Resources/AppIcon.icns",
+      "Resources/zh-Hans.lproj",
+      "Resources/en.lproj",
+      "Resources/Markdown"
+    ],
+    "resourceBundles": [
+      "BigBang_BigBangCore.bundle"
+    ],
+    "dependencyLicenses": [
+      "OpenAI",
+      "swift-openapi-runtime",
+      "swift-http-types"
+    ]
+  },
+  "xcode": {
+    "scheme": "BigBang"
+  },
+  "testScripts": [
+    "Tests/Tools/test-verify-native.sh"
+  ],
+  "nativeTests": {
+    "localizationScript": "Tests/Tools/verify_native.sh"
+  },
+  "shared": {
+    "designDestination": "Sources/BigBang/MacAppDesign.swift",
+    "localizationDestination": "Sources/BigBangCore/LocalizationResources.swift"
+  }
+}
