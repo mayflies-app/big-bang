@@ -81,6 +81,9 @@ and does not create a vertical scroll container.
 The renderer retains selected fragments and surrounding context across streaming
 rerenders, including the removal of closing Markdown markers. If the selected
 fragment disappears, the selection is cleared instead of selecting unrelated text.
+Selection messages include `restored: true` for these rendering updates, so the
+native host preserves the reader's choice to follow output. Pointer and keyboard
+interaction clears that marker; a new selection pauses following as usual.
 
 The Node syntax/security/streaming regression matrix runs with `npm test`.
 Run native fixtures for changes to the WebKit bridge, scrolling, selection or

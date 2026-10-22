@@ -157,10 +157,32 @@ import BigBangCore
             note.model.output = "尚未结束的 **重点 🌍"
             checks["unclosedInlineRendered"] = await rendered(text, source: note.model.output)
             text.setSelectedRange((text.renderedText as NSString).range(of: "重点 🌍"))
-            _ = await wait({ text.selectedText == "重点 🌍" })
+            checks["unclosedInlineSelectionPausesFollowing"] = await wait {
+                text.selectedText == "重点 🌍" && !note.model.autoScroll
+            }
+            let unclosedSelectionRange = text.selectedRange()
+            note.model.autoScroll = true
             note.model.output += "**\n\n下一段"
             checks["closedInlineRendered"] = await rendered(text, source: note.model.output)
+            _ = await wait { text.selectedText == "重点 🌍" && text.selectedRange() != unclosedSelectionRange }
+            // Restoring the same selected text can move its DOM range when Markdown
+            // delimiters close. Let selectionchange IPC settle before checking following.
+            await pause(160)
             checks["closingMarkersKeepSelectedText"] = text.selectedText == "重点 🌍"
+            checks["closingMarkersMoveSelectedRange"] = text.selectedRange().length > 0 &&
+                text.selectedRange() != unclosedSelectionRange
+            let restoredInlineSelection = try? await text.selectionSnapshot()
+            checks["closingMarkersKeepFollowingWithRestoredSelection"] = note.model.autoScroll &&
+                restoredInlineSelection == "重点 🌍"
+            observations["inlineSelectionRestoration"] = ["rangeBefore": NSStringFromRange(unclosedSelectionRange),
+                "rangeAfter": NSStringFromRange(text.selectedRange()), "selectedText": text.selectedText,
+                "autoScroll": note.model.autoScroll]
+            let differentInlineSelection = (text.renderedText as NSString).range(of: "下一段")
+            text.setSelectedRange(differentInlineSelection)
+            checks["userSelectionAfterInlineRestorePausesFollowing"] = await wait {
+                differentInlineSelection.location != NSNotFound && text.selectedRange() == differentInlineSelection &&
+                    text.selectedText == "下一段" && !note.model.autoScroll
+            }
 
             note.model.output = "```swift\nlet unfinished = 1\n\n**still code"
             let unclosedRendered = await rendered(text, source: note.model.output)

@@ -6,6 +6,7 @@ const root = document.getElementById('markdown-root');
 const parse = createRenderer();
 const cleanDiagram = createDiagramSanitizer(window);
 let revision = 0, source = '', diagramQueue = Promise.resolve(), layoutPending = false;
+let restoredSelection = null;
 const blockTags = new Set(['P', 'DIV', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'PRE', 'LI', 'BLOCKQUOTE', 'TR', 'SECTION']);
 function post(message) { window.webkit?.messageHandlers?.sticky?.postMessage(message); }
 function indexText() {
@@ -40,6 +41,7 @@ function selection() {
   return {revision, location: Math.min(start, end), length: Math.abs(end - start), text: selected.toString()};
 }
 function selectRange(location, length) {
+  restoredSelection = null;
   const index = indexText(); const start = Math.max(0, Math.min(index.text.length, Number(location) || 0)); const end = Math.max(start, Math.min(index.text.length, start + (Number(length) || 0)));
   function point(offset, isEnd = false) {
     const entry = index.entries.find(item => isEnd ? offset <= item.end : offset < item.end) || index.entries[index.entries.length - 1];
@@ -56,6 +58,7 @@ function captureSelection() {
   return {...current, fragment: text.slice(current.location, current.location + current.length), before: text.slice(Math.max(0, current.location - 32), current.location), after: text.slice(current.location + current.length, current.location + current.length + 32)};
 }
 function restoreSelection(saved) {
+  restoredSelection = null;
   if (!saved) return;
   const text = indexText().text; const occurrences = []; let position = -1;
   while ((position = text.indexOf(saved.fragment, position + 1)) >= 0) occurrences.push(position);
@@ -68,7 +71,7 @@ function restoreSelection(saved) {
     return score;
   }
   const best = occurrences.reduce((a, b) => affinity(b) > affinity(a) ? b : a);
-  selectRange(best, saved.fragment.length);
+  restoredSelection = selectRange(best, saved.fragment.length);
 }
 function layout() {
   if (layoutPending) return; layoutPending = true;
@@ -133,7 +136,17 @@ root.addEventListener('click', event => {
     if (target) post({type: 'anchor', revision, y: Math.max(0, target.getBoundingClientRect().top + window.scrollY)});
   } else if (!safeLink(href)) event.preventDefault();
 });
-document.addEventListener('selectionchange', () => post({type: 'selection', ...selection()}));
+// Restoring a selection during rendering is not a new request to pause following.
+// Keep its snapshot until the user interacts or the selection actually changes:
+// WebKit can deliver more than one selectionchange for a DOM replacement.
+document.addEventListener('selectionchange', () => {
+  const current = selection();
+  const restored = restoredSelection !== null && ['revision', 'location', 'length', 'text'].every(key => current[key] === restoredSelection[key]);
+  if (!restored) restoredSelection = null;
+  post({type: 'selection', ...current, restored});
+});
+document.addEventListener('pointerdown', () => { restoredSelection = null; });
+document.addEventListener('keydown', () => { restoredSelection = null; });
 root.addEventListener('contextmenu', event => { event.preventDefault(); post({type: 'contextMenu', revision, x: event.clientX, y: event.clientY}); });
 document.addEventListener('keydown', event => { if (event.key === 'Escape') { event.preventDefault(); post({type: 'close'}); } });
 new ResizeObserver(layout).observe(root);

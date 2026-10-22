@@ -182,7 +182,9 @@ struct StickyMarkdownView: NSViewRepresentable {
             guard incoming == renderedRevision || incoming == revision else { return }
             selectedText = body["text"] as? String ?? ""
             cachedRange = NSRange(location: max(0, body["location"] as? Int ?? 0), length: max(0, body["length"] as? Int ?? 0))
-            if !selectedText.isEmpty { onSelection?() }
+            // Streaming can restore the same selected fragment at a different offset
+            // when Markdown closes. Only a fresh selection pauses the reader's follow choice.
+            if !selectedText.isEmpty && body["restored"] as? Bool != true { onSelection?() }
         case "anchor":
             guard incoming == revision, let y = body["y"] as? Double, y.isFinite else { return }
             scrollToDocumentY(CGFloat(y))
