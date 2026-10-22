@@ -44,6 +44,7 @@ import BigBangCore
             }
             checks[name + ".initialRendererReady"] = text.ready && text.renderingComplete && text.renderedSource == note.model.output && text.renderedText.utf16.count >= 4
             guard checks[name + ".initialRendererReady"] == true else { window.close(); continue }
+            checks[name + ".shortOutputHidesJumpToLatest"] = element(in: note.hostingView, identifier: "sticky.follow-latest") == nil
             let limit = min(StickyWindow.maximumHeight,
                             max(StickyWindow.minimumHeight, (window.screen?.visibleFrame.height ?? 560) - 40))
             if let visible = window.screen?.visibleFrame {
@@ -55,8 +56,10 @@ import BigBangCore
             let selectedWidth = text.bounds.width
             let selectedOffset = scroll.documentVisibleRect.minY
             text.setSelectedRange(selection)
-            await pause(60)
-            checks[name + ".growingOutputRemainsSelectable"] = text.selectedRange() == selection && !note.model.autoScroll
+            checks[name + ".growingOutputRemainsSelectable"] = await waitFor {
+                text.selectedRange() == selection && !note.model.autoScroll
+            }
+            checks[name + ".pausedShortOutputHidesJumpToLatest"] = element(in: note.hostingView, identifier: "sticky.follow-latest") == nil
             note.model.output += "\n\n选择期间追加的短段落。"
             await pause(100)
             checks[name + ".growthPreservesNativeSelection"] = text.selectedRange() == selection &&
@@ -112,6 +115,7 @@ import BigBangCore
             checks[name + ".longOutputReachesHeightLimit"] = abs(window.frame.height - limit) < 1
             checks[name + ".heightLimitAllowsOverflow"] = document.bounds.height > scroll.contentView.bounds.height + 100
             checks[name + ".heightLimitFollowsBottom"] = scroll.documentVisibleRect.maxY >= document.bounds.height - 25
+            checks[name + ".followingOverflowHidesJumpToLatest"] = element(in: note.hostingView, identifier: "sticky.follow-latest") == nil
             checks[name + ".heightLimitUsesRequestedScrollerStyle"] = scroll.scrollerStyle == style
             checks[name + ".heightLimitRetainsNativeScroller"] = scroll.hasVerticalScroller && scroll.verticalScroller != nil
             if style == .legacy {
@@ -120,6 +124,9 @@ import BigBangCore
             checks[name + ".overflowScreenshotSaved"] = snapshot(window, reportURL: reportURL, name: name + "-overflow.png")
 
             recorder.phase = "reading"
+            let readingWindowFrame = window.frame
+            let readingViewportSize = scroll.contentView.bounds.size
+            let readingTextWidth = text.bounds.width
             let bottom = scroll.documentVisibleRect.minY
             scroll.contentView.scroll(to: NSPoint(x: 0, y: max(0, bottom - 180)))
             scroll.reflectScrolledClipView(scroll.contentView)
@@ -132,10 +139,61 @@ import BigBangCore
                 // controls following explicitly rather than detecting manual scrolling.
                 note.model.autoScroll = false
             }
+            checks[name + ".readingOlderTextShowsJumpToLatest"] = await waitFor {
+                guard let button = element(in: note.hostingView, identifier: "sticky.follow-latest") else { return false }
+                let buttonFrame = accessibilityFrame(button)
+                return buttonFrame.width > 0 && buttonFrame.height > 0 && window.frame.contains(buttonFrame) &&
+                    accessibilityLabel(button) == "回到最新内容"
+            }
+            checks[name + ".showingJumpToLatestKeepsGeometry"] = sameGeometry(window.frame, readingWindowFrame) &&
+                abs(scroll.contentView.bounds.width - readingViewportSize.width) <= 1 &&
+                abs(scroll.contentView.bounds.height - readingViewportSize.height) <= 1 &&
+                abs(text.bounds.width - readingTextWidth) <= 1
             note.model.output += "\n\n读旧段落时收到的新内容。"
             await pause(100)
             recorder.capture("stable")
             checks[name + ".newOutputPreservesReadingPosition"] = abs(scroll.documentVisibleRect.minY - olderOffset) < 2
+            checks[name + ".newOutputKeepsJumpToLatestVisible"] = element(in: note.hostingView, identifier: "sticky.follow-latest") != nil
+            configuration.language = .english
+            note.updateConfiguration(configuration)
+            checks[name + ".jumpToLatestUpdatesLanguageImmediately"] = await waitFor {
+                guard let button = element(in: note.hostingView, identifier: "sticky.follow-latest") else { return false }
+                return accessibilityLabel(button) == "Jump to Latest"
+            }
+            checks[name + ".jumpToLatestLanguageChangeKeepsGeometryAndPosition"] = sameGeometry(window.frame, readingWindowFrame) &&
+                abs(scroll.contentView.bounds.width - readingViewportSize.width) <= 1 &&
+                abs(scroll.contentView.bounds.height - readingViewportSize.height) <= 1 &&
+                abs(text.bounds.width - readingTextWidth) <= 1 && abs(scroll.documentVisibleRect.minY - olderOffset) < 2
+            checks[name + ".jumpToLatestScreenshotSaved"] = snapshot(window, reportURL: reportURL, name: name + "-jump-to-latest.png")
+            checks[name + ".jumpToLatestAcceptsAccessibilityPress"] = element(in: note.hostingView, identifier: "sticky.follow-latest").map(press) == true
+            checks[name + ".jumpToLatestRestoresFollowingAndBottom"] = await waitFor {
+                note.model.autoScroll && scroll.documentVisibleRect.maxY >= document.bounds.height - 25
+            }
+            checks[name + ".jumpToLatestDisappearsAfterResuming"] = await waitFor {
+                element(in: note.hostingView, identifier: "sticky.follow-latest") == nil
+            }
+            checks[name + ".hidingJumpToLatestKeepsGeometry"] = sameGeometry(window.frame, readingWindowFrame) &&
+                abs(scroll.contentView.bounds.width - readingViewportSize.width) <= 1 &&
+                abs(scroll.contentView.bounds.height - readingViewportSize.height) <= 1 &&
+                abs(text.bounds.width - readingTextWidth) <= 1
+            note.model.output += "\n\n点击回到最新内容后继续输出。"
+            checks[name + ".jumpToLatestContinuesFollowingNewOutput"] = await waitFor {
+                text.renderedSource == note.model.output && text.renderingComplete &&
+                    scroll.documentVisibleRect.maxY >= document.bounds.height - 25
+            }
+            configuration.language = .simplifiedChinese
+            note.updateConfiguration(configuration)
+
+            // Keep the independent native-scroll route covered after testing the button.
+            let resumedBottom = scroll.documentVisibleRect.minY
+            scroll.contentView.scroll(to: NSPoint(x: 0, y: max(0, resumedBottom - 180)))
+            scroll.reflectScrolledClipView(scroll.contentView)
+            await pause(120)
+            if #available(macOS 15.0, *) {
+                checks[name + ".readingOlderTextPausesAgainAfterJump"] = !note.model.autoScroll
+            } else {
+                note.model.autoScroll = false
+            }
             scroll.contentView.scroll(to: NSPoint(x: 0, y: max(0, document.bounds.height - scroll.contentView.bounds.height)))
             scroll.reflectScrolledClipView(scroll.contentView)
             await pause(120)
@@ -148,15 +206,64 @@ import BigBangCore
             await pause(100)
             checks[name + ".resumedFollowingReachesNewBottom"] = scroll.documentVisibleRect.maxY >= document.bounds.height - 25
 
+            // A live DOM selection must survive a pointer click on the overlay. Rendering
+            // later chunks restores that selection and must not pause following again.
+            recorder.phase = "selectedTextMouseJump"
+            text.setSelectedRange(selection)
+            checks[name + ".selectedTextShowsJumpToLatest"] = await waitFor {
+                text.selectedRange() == selection && !note.model.autoScroll &&
+                    element(in: note.hostingView, identifier: "sticky.follow-latest") != nil
+            }
+            let liveSelectedText = (try? await text.selectionSnapshot()) ?? ""
+            checks[name + ".mouseJumpStartsWithLiveDOMSelection"] = !liveSelectedText.isEmpty && liveSelectedText == selectedText
+            checks[name + ".jumpToLatestAcceptsNativeMouseClick"] = element(in: note.hostingView, identifier: "sticky.follow-latest")
+                .map { click($0, in: window) } == true
+            _ = await waitFor { note.model.autoScroll && scroll.documentVisibleRect.maxY >= document.bounds.height - 25 }
+            await pause(120)
+            let selectedAfterMouseJump = (try? await text.selectionSnapshot()) ?? ""
+            checks[name + ".mouseJumpPreservesSelectionAndResumesFollowing"] = selectedAfterMouseJump == liveSelectedText &&
+                !liveSelectedText.isEmpty && text.selectedRange() == selection && note.model.autoScroll &&
+                scroll.documentVisibleRect.maxY >= document.bounds.height - 25 &&
+                element(in: note.hostingView, identifier: "sticky.follow-latest") == nil
+            var selectedChunkObservations: [[String: Any]] = []
+            for chunk in 1...2 {
+                note.model.output += "\n\n保留正文选区并点击回到最新内容后，第 \(chunk) 次继续输出。"
+                let rendered = await waitFor { text.renderedSource == note.model.output && text.renderingComplete }
+                // Allow the renderer's selectionchange IPC and SwiftUI updates to settle.
+                await pause(160)
+                let liveSelection = (try? await text.selectionSnapshot()) ?? ""
+                let stillFollowing = note.model.autoScroll && scroll.documentVisibleRect.maxY >= document.bounds.height - 25
+                let jumpHidden = element(in: note.hostingView, identifier: "sticky.follow-latest") == nil
+                checks[name + ".selectedMouseJumpChunk\(chunk)KeepsFollowing"] = rendered && stillFollowing && jumpHidden
+                checks[name + ".selectedMouseJumpChunk\(chunk)KeepsDOMSelection"] = !liveSelectedText.isEmpty &&
+                    liveSelection == liveSelectedText && text.selectedRange() == selection
+                recorder.capture("stable")
+                selectedChunkObservations.append(["chunk": chunk, "rendered": rendered, "selection": liveSelection,
+                    "autoScroll": note.model.autoScroll, "jumpHidden": jumpHidden,
+                    "visibleBottom": scroll.documentVisibleRect.maxY, "documentHeight": document.bounds.height])
+            }
+            histories[name + ".selectedMouseJump"] = ["selectionBefore": liveSelectedText,
+                "selectionAfterClick": selectedAfterMouseJump, "chunks": selectedChunkObservations]
+            let changedSelection = NSRange(location: 1, length: 3)
+            text.setSelectedRange(changedSelection)
+            checks[name + ".changedNonemptySelectionPausesFollowingAgain"] = await waitFor {
+                text.selectedRange() == changedSelection && !note.model.autoScroll &&
+                    element(in: note.hostingView, identifier: "sticky.follow-latest") != nil
+            }
+            text.setSelectedRange(NSRange(location: 0, length: 0))
+
             let longOutput = note.model.output
             recorder.phase = "retry"
             note.model.retry?()
-            await pause(120)
+            checks[name + ".localRetryResetsFollowingAndGeometry"] = await waitFor {
+                recorder.capture("settling")
+                return text.renderedSource == note.model.output && text.renderingComplete &&
+                    note.model.autoScroll && note.model.running &&
+                    abs(window.frame.height - StickyWindow.minimumHeight) < 1 &&
+                    abs(scroll.documentVisibleRect.minY) < 1 && abs(text.bounds.width - baseline.textWidth) <= 1 &&
+                    recorder.samples.last?.scrollerVisible == false
+            }
             recorder.capture("stable")
-            checks[name + ".localRetryResetsFollowingAndGeometry"] = note.model.autoScroll && note.model.running &&
-                abs(window.frame.height - StickyWindow.minimumHeight) < 1 &&
-                abs(scroll.documentVisibleRect.minY) < 1 && abs(text.bounds.width - baseline.textWidth) <= 1 &&
-                recorder.samples.last?.scrollerVisible == false
 
             // Return to overflow so shortening separately exercises the enabled-to-fit
             // transition instead of merely replacing one already-short result.
@@ -173,6 +280,7 @@ import BigBangCore
             recorder.capture("stable")
             checks[name + ".shorteningRestoresMinimumHeight"] = abs(window.frame.height - StickyWindow.minimumHeight) < 1
             checks[name + ".shorteningRestoresTopAndNoScroller"] = abs(scroll.documentVisibleRect.minY) < 1 && recorder.samples.last?.scrollerVisible == false
+            checks[name + ".shorteningHidesJumpToLatest"] = element(in: note.hostingView, identifier: "sticky.follow-latest") == nil
             recorder.stop()
             histories[name] = recorder.samples.map(\.json)
             note.window?.close()
@@ -189,6 +297,57 @@ import BigBangCore
 
     private static func pause(_ milliseconds: Int) async {
         try? await Task.sleep(for: .milliseconds(milliseconds))
+    }
+    private static func waitFor(_ condition: () -> Bool) async -> Bool {
+        for _ in 0..<100 {
+            if condition() { return true }
+            await pause(20)
+        }
+        return condition()
+    }
+    private static func element(in root: Any?, identifier: String) -> NSObject? {
+        guard let object = root as? NSObject else { return nil }
+        let id = NSSelectorFromString("accessibilityIdentifier")
+        if object.responds(to: id), object.perform(id)?.takeUnretainedValue() as? String == identifier { return object }
+        let children = NSSelectorFromString("accessibilityChildren")
+        guard object.responds(to: children), let items = object.perform(children)?.takeUnretainedValue() as? [Any] else { return nil }
+        return items.lazy.compactMap { element(in: $0, identifier: identifier) }.first
+    }
+    private static func accessibilityLabel(_ object: NSObject) -> String? {
+        let selector = NSSelectorFromString("accessibilityLabel")
+        guard object.responds(to: selector) else { return nil }
+        return object.perform(selector)?.takeUnretainedValue() as? String
+    }
+    private static func accessibilityFrame(_ object: NSObject) -> NSRect {
+        let selector = NSSelectorFromString("accessibilityFrame")
+        guard object.responds(to: selector) else { return .zero }
+        typealias Frame = @convention(c) (AnyObject, Selector) -> NSRect
+        return unsafeBitCast(object.method(for: selector), to: Frame.self)(object, selector)
+    }
+    private static func press(_ object: NSObject) -> Bool {
+        let selector = NSSelectorFromString("accessibilityPerformPress")
+        guard object.responds(to: selector) else { return false }
+        typealias Action = @convention(c) (AnyObject, Selector) -> ObjCBool
+        return unsafeBitCast(object.method(for: selector), to: Action.self)(object, selector).boolValue
+    }
+    private static func click(_ object: NSObject, in window: NSWindow) -> Bool {
+        let frame = accessibilityFrame(object)
+        guard frame.width > 0, frame.height > 0, window.frame.contains(frame) else { return false }
+        let location = window.convertPoint(fromScreen: NSPoint(x: frame.midX, y: frame.midY))
+        let timestamp = ProcessInfo.processInfo.systemUptime
+        guard let down = NSEvent.mouseEvent(with: .leftMouseDown, location: location, modifierFlags: [],
+            timestamp: timestamp, windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 1),
+              let up = NSEvent.mouseEvent(with: .leftMouseUp, location: location, modifierFlags: [],
+            timestamp: timestamp + 0.05, windowNumber: window.windowNumber, context: nil, eventNumber: 2, clickCount: 1, pressure: 0) else { return false }
+        // AppKit controls may enter a tracking loop in mouseDown. Queue mouseUp
+        // first so that loop can consume it before sendEvent returns.
+        NSApp.postEvent(up, atStart: true)
+        NSApp.sendEvent(down)
+        return true
+    }
+    private static func sameGeometry(_ lhs: NSRect, _ rhs: NSRect) -> Bool {
+        abs(lhs.minX - rhs.minX) <= 1 && abs(lhs.minY - rhs.minY) <= 1 &&
+            abs(lhs.width - rhs.width) <= 1 && abs(lhs.height - rhs.height) <= 1
     }
     private static func findScroll(in root: NSView) -> NSScrollView? {
         if let scroll = root as? NSScrollView { return scroll }

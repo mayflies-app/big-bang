@@ -154,6 +154,24 @@ struct StickyView: View {
                 .onChange(of: model.output) { _, _ in
                     if model.autoScroll && model.contentOverflows { proxy.scrollTo("end", anchor: .bottom) }
                 }
+                .overlay(alignment: .bottom) {
+                    if model.contentOverflows && !model.autoScroll && !model.awaitingInput && !model.output.isEmpty {
+                        Button {
+                            model.autoScroll = true
+                            proxy.scrollTo("end", anchor: .bottom)
+                        } label: {
+                            Label(L10n.string("回到最新内容", language: model.language), systemImage: "arrow.down")
+                                .font(.system(size: 12, weight: .medium))
+                                .padding(.horizontal, 4).padding(.vertical, 2)
+                        }
+                        .buttonStyle(.bordered).controlSize(.small)
+                        .background(.regularMaterial, in: Capsule())
+                        .clipShape(Capsule())
+                        .help(L10n.string("跟随输出", language: model.language))
+                        .accessibilityIdentifier("sticky.follow-latest")
+                        .padding(.bottom, 12)
+                    }
+                }
             }
         }.foregroundStyle(.primary)
             .onChange(of: model.running) { _, running in
@@ -330,6 +348,7 @@ private struct OutputFollowing: ViewModifier {
                 .onChange(of: canScroll) { _, enabled in if enabled && follow { scrollToEnd() } }
         } else {
             content
+                .onChange(of: follow) { _, enabled in if enabled && canScroll { scrollToEnd() } }
                 .onChange(of: canScroll) { _, enabled in if enabled && follow { scrollToEnd() } }
         }
     }

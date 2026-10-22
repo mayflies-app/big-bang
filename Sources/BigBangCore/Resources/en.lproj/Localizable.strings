@@ -132,6 +132,7 @@
 "请输入模型名称。" = "Enter a model name.";
 "读取其他应用中选中的文字。" = "Read selected text in other apps.";
 "跟随输出" = "Follow Output";
+"回到最新内容" = "Jump to Latest";
 "辅助功能权限" = "Accessibility Permission";
 "输入 API Key" = "Enter API Key";
 "输出内容" = "Output";
