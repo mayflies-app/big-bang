@@ -56,6 +56,7 @@ import BigBangCore
         var observations: [[String: Any]] = []
         var errors: [String] = []
         var recording = false
+        var recordingChanges: [Bool] = []
         lazy var editor = SettingsEditor(configuration: persisted, save: { [unowned self] configuration, key in
             guard key.isEmpty else { throw ValidationError("Unexpected credential write in IME fixture") }
             try configuration.validate()
@@ -68,11 +69,20 @@ import BigBangCore
             persisted.presets[0].name = "已有名称"
             persisted.presets[0].prompt = "开头🙂保留\n末尾"
             window.contentView = GlassSurface.wrap(NSHostingView(rootView: SettingsView(editor: editor,
-                demo: {}, onRecordingChange: { [weak self] in self?.recording = $0 }, loginItems: .preview())), cornerRadius: 12)
+                demo: {}, onRecordingChange: { [weak self] value in
+                    self?.recording = value
+                    self?.recordingChanges.append(value)
+                }, loginItems: .preview())), cornerRadius: 12)
             window.delegate = self
             window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             await pause(200)
+            for _ in 0..<50 {
+                if NSApp.isActive && window.isKeyWindow { break }
+                await pause(20)
+            }
+            observations.append(["phase": "settings.initialActivation",
+                "applicationIsActive": NSApp.isActive, "windowIsKey": window.isKeyWindow])
             checkMenuMappings()
 
             try await compose("model", identifier: "settings.model", baseline: "fixture-model", replacement: "中文模型",
@@ -88,12 +98,16 @@ import BigBangCore
             guard recorderCandidates.count == 1, let recorder = recorderCandidates.first else {
                 throw targetFailure("settings.preset.\(id).shortcut", "Expected one native recorder for the fixture shortcut")
             }
+            observations.append(["phase": "recorder.initial",
+                "applicationIsActive": NSApp.isActive, "windowIsKey": window.isKeyWindow,
+                "recorderAttached": recorder.window === window])
             recorder.performClick(nil)
             await pause(50)
             let recordingStarted = recording && window.firstResponder === recorder
             await sendKey("\u{1b}", code: 53, modifiers: [])
             checks["escapeCancelsRecorderBeforeClosingSettings"] = recordingStarted && window.isVisible &&
                 !recording && editor.draft.presets[0].shortcut == shortcutBeforeRecording
+            await recorderWindowLifecycle(recorder, shortcut: shortcutBeforeRecording)
             try await compose("name", identifier: "settings.preset.\(id).name", baseline: "已有名称", replacement: "中文名称",
                           current: { $0.presets[0].name })
             try await compose("prompt", identifier: "settings.preset.\(id).prompt", baseline: "开头🙂保留\n末尾", replacement: "你好世界",
@@ -213,6 +227,103 @@ import BigBangCore
                 checks["commandWClosesFocusedNote"] = !panel.isVisible
                 panel.close()
             }
+        }
+
+        func recorderWindowLifecycle(_ recorder: RecorderButton, shortcut: Shortcut) async {
+            func reopenSettings(_ phase: String) async {
+                // Match AppDelegate.showSettings: reopening an accessory app's
+                // only window also requests application activation.
+                window.makeKeyAndOrderFront(nil)
+                NSApp.activate(ignoringOtherApps: true)
+                await pause(80)
+                for _ in 0..<50 {
+                    if NSApp.isActive && window.isKeyWindow { break }
+                    await pause(20)
+                }
+                observations.append(["phase": "recorder.reopen.\(phase)",
+                    "applicationIsActive": NSApp.isActive, "windowIsKey": window.isKeyWindow,
+                    "recorderAttached": recorder.window === window])
+            }
+            // Closing a retained settings window does not destroy its native controls
+            // or necessarily resign its first responder. Cancellation must follow
+            // the window lifecycle rather than representable destruction.
+            let closeStart = recordingChanges.count
+            recorder.performClick(nil)
+            let closeStarted = recording && window.firstResponder === recorder
+            window.performClose(nil)
+            await pause(80)
+            checks["closingSettingsCancelsRecorderExactlyOnce"] = closeStarted && !window.isVisible && !recording &&
+                recorder.title == shortcut.label && Array(recordingChanges.dropFirst(closeStart)) == [true, false] &&
+                editor.draft.presets[0].shortcut == shortcut
+            observations.append(["phase": "recorder.close", "recording": recording,
+                "title": recorder.title, "callbackChanges": Array(recordingChanges.dropFirst(closeStart)),
+                "retainedFirstResponder": window.firstResponder === recorder])
+            recorder.endRecording() // Keep later checks independent on a failing baseline.
+            await reopenSettings("afterClose")
+
+            let other = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 240, height: 100),
+                styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            other.isReleasedWhenClosed = false
+            let field = NSTextField(string: "")
+            field.frame = NSRect(x: 20, y: 30, width: 200, height: 24)
+            other.contentView?.addSubview(field)
+            defer { other.close() }
+            let resignStart = recordingChanges.count
+            recorder.performClick(nil)
+            let resignStarted = recording && window.firstResponder === recorder
+            other.makeKeyAndOrderFront(nil)
+            other.makeFirstResponder(field)
+            await pause(80)
+            checks["losingKeyWindowCancelsRecorderExactlyOnce"] = resignStarted && other.isKeyWindow && !window.isKeyWindow &&
+                !recording && recorder.title == shortcut.label &&
+                Array(recordingChanges.dropFirst(resignStart)) == [true, false]
+            if let event = NSEvent.keyEvent(with: .keyDown, location: .zero,
+                modifierFlags: [.control, .option], timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: other.windowNumber, context: nil, characters: "k",
+                charactersIgnoringModifiers: "k", isARepeat: false, keyCode: 40) {
+                NSApp.sendEvent(event)
+            }
+            await pause(50)
+            checks["otherWindowKeyboardDoesNotChangeShortcut"] = other.isKeyWindow &&
+                editor.draft.presets[0].shortcut == shortcut && !recording
+            observations.append(["phase": "recorder.resignKey", "recording": recording,
+                "otherWindowIsKey": other.isKeyWindow, "title": recorder.title,
+                "callbackChanges": Array(recordingChanges.dropFirst(resignStart))])
+            recorder.endRecording()
+            editor.draft.presets[0].shortcut = shortcut
+            if CGPreflightPostEventAccess(), let mainScreen = NSScreen.screens.first {
+                // Use a posted mouse event to exercise AppKit's first click on an
+                // inactive window, including activation before the action fires.
+                window.orderFront(nil)
+                let frame = window.convertToScreen(recorder.convert(recorder.bounds, to: nil))
+                let location = CGPoint(x: frame.midX, y: mainScreen.frame.maxY - frame.midY)
+                let clickStart = recordingChanges.count
+                let startsInactive = !window.isKeyWindow && other.isKeyWindow
+                let source = CGEventSource(stateID: .privateState)
+                CGEvent(mouseEventSource: source, mouseType: .leftMouseDown, mouseCursorPosition: location, mouseButton: .left)?.post(tap: .cghidEventTap)
+                CGEvent(mouseEventSource: source, mouseType: .leftMouseUp, mouseCursorPosition: location, mouseButton: .left)?.post(tap: .cghidEventTap)
+                await pause(150)
+                checks["inactiveSettingsFirstMouseClickStartsRecording"] = startsInactive && window.isKeyWindow &&
+                    recording && window.firstResponder === recorder && Array(recordingChanges.dropFirst(clickStart)) == [true]
+                other.makeKeyAndOrderFront(nil)
+                await pause(80)
+                checks["firstMouseClickRecordingCancelsOnWindowChange"] = !recording && other.isKeyWindow &&
+                    recorder.title == shortcut.label && Array(recordingChanges.dropFirst(clickStart)) == [true, false] &&
+                    editor.draft.presets[0].shortcut == shortcut
+                recorder.endRecording()
+            } else {
+                observations.append(["phase": "recorder.inactiveWindowMouseClick", "executed": false,
+                    "reason": "System mouse-event posting is not available; no permission requested."])
+            }
+            other.close()
+            await reopenSettings("afterOtherWindow")
+            let reopenStart = recordingChanges.count
+            recorder.performClick(nil)
+            let reopened = recording && window.firstResponder === recorder
+            await sendKey("\u{1b}", code: 53, modifiers: [])
+            checks["reopenedSettingsCanRecordAndCancelAgain"] = reopened && !recording && window.isVisible &&
+                recorder.title == shortcut.label && Array(recordingChanges.dropFirst(reopenStart)) == [true, false] &&
+                editor.draft.presets[0].shortcut == shortcut
         }
 
         func windowWillClose(_ notification: Notification) { editor.flush() }

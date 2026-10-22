@@ -243,11 +243,21 @@ import BigBangCore
             }
             sentinel.makeKeyAndOrderFront(nil)
             sentinel.makeFirstResponder(sentinelText)
+            func observeSentinel(_ stage: String) {
+                observations.append(["phase": prefix + "sentinel." + stage,
+                    "applicationIsActive": NSApp.isActive, "sentinelIsKey": sentinel.isKeyWindow,
+                    "sentinelFirstResponderIsText": sentinel.firstResponder === sentinelText,
+                    "keyWindowIsSentinel": NSApp.keyWindow === sentinel,
+                    "keyWindowType": NSApp.keyWindow.map { String(reflecting: type(of: $0)) } ?? "none"])
+            }
+            observeSentinel("immediate")
             await drainMainQueue()
+            observeSentinel("afterDrain")
             let editorInitiallyReleased = autoreleasepool { closedEditor == nil }
             let release = await observeRelease {
                 closedOwner == nil && closedWindow == nil && closedEditor == nil && closedHosting == nil
             }
+            observeSentinel("afterRelease")
             checks[prefix + "closeStartsWithAttachedPendingFocus"] = queuedWhileAttached
             checks[prefix + "closeReleasesOwnerWindowEditorAndHosting"] = release.released
             checks[prefix + "lateFocusDoesNotStealSentinel"] = sentinel.isKeyWindow && sentinel.firstResponder === sentinelText

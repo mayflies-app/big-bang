@@ -92,18 +92,34 @@ final class RecorderButton: NSButton {
         outline.lineWidth = focused || recording ? 1.5 : 1; outline.stroke()
     }
     @objc func beginRecording() {
-        guard !recording else { return }
-        window?.makeFirstResponder(self)
+        guard !recording, let window, window.isKeyWindow, window.makeFirstResponder(self) else { return }
         previousTitle = title; recording = true; title = L10n.string("按下快捷键…", language: language); needsDisplay = true
+        // A retained window keeps its first responder when it closes or loses key
+        // status. End capture there so shortcuts resume before another window types.
+        for name in [NSWindow.didResignKeyNotification, NSWindow.willCloseNotification] {
+            NotificationCenter.default.addObserver(self, selector: #selector(recordingWindowEnded(_:)), name: name, object: window)
+        }
         onRecordingChange?(true)
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self, self.recording else { return event }
+            guard let window = self.window, window.isKeyWindow, event.window === window else {
+                self.endRecording()
+                return event
+            }
             self.keyDown(with: event)
             return nil
         }
     }
+    @objc private func recordingWindowEnded(_ notification: Notification) { endRecording() }
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        endRecording()
+        super.viewWillMove(toWindow: newWindow)
+    }
     func endRecording() {
         if let monitor { NSEvent.removeMonitor(monitor); self.monitor = nil }
+        for name in [NSWindow.didResignKeyNotification, NSWindow.willCloseNotification] {
+            NotificationCenter.default.removeObserver(self, name: name, object: nil)
+        }
         if recording { recording = false; title = previousTitle; onRecordingChange?(false) }
         needsDisplay = true
     }
