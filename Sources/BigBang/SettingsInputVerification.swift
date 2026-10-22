@@ -19,7 +19,7 @@ import BigBangCore
             NSApp.terminate(nil)
             return
         }
-        let fixture = Fixture()
+        let fixture = Fixture(reportDirectory: reportURL.deletingLastPathComponent())
         fixture.checks.merge(lifecycle.checks) { _, new in new }
         fixture.observations.append(contentsOf: lifecycle.observations)
         do { try await fixture.run() }
@@ -50,6 +50,7 @@ import BigBangCore
 
     @MainActor private final class Fixture: NSObject, NSWindowDelegate {
         let window = SettingsWindow()
+        let reportDirectory: URL
         var persisted = Configuration(language: .simplifiedChinese)
         var saves: [Configuration] = []
         var checks: [String: Bool] = [:]
@@ -57,9 +58,15 @@ import BigBangCore
         var errors: [String] = []
         var recording = false
         var recordingChanges: [Bool] = []
+        init(reportDirectory: URL) {
+            self.reportDirectory = reportDirectory
+            super.init()
+        }
+        var rejectsPresetSave = false
         lazy var editor = SettingsEditor(configuration: persisted, save: { [unowned self] configuration, key in
             guard key.isEmpty else { throw ValidationError("Unexpected credential write in IME fixture") }
             try configuration.validate()
+            if rejectsPresetSave { throw ValidationError("Fixture rejected preset save") }
             persisted = configuration
             saves.append(configuration)
         }, deleteKey: {})
@@ -108,6 +115,8 @@ import BigBangCore
             checks["escapeCancelsRecorderBeforeClosingSettings"] = recordingStarted && window.isVisible &&
                 !recording && editor.draft.presets[0].shortcut == shortcutBeforeRecording
             await recorderWindowLifecycle(recorder, shortcut: shortcutBeforeRecording)
+            await presetDeletionRecovery()
+            await repeatedPresetAddition()
             try await compose("name", identifier: "settings.preset.\(id).name", baseline: "已有名称", replacement: "中文名称",
                           current: { $0.presets[0].name })
             try await compose("prompt", identifier: "settings.preset.\(id).prompt", baseline: "开头🙂保留\n末尾", replacement: "你好世界",
@@ -227,6 +236,177 @@ import BigBangCore
                 checks["commandWClosesFocusedNote"] = !panel.isVisible
                 panel.close()
             }
+        }
+
+        func presetDeletionRecovery() async {
+            let original = editor.draft
+            var customized = original
+            customized.presets[1].name = "误删恢复🙂"
+            customized.presets[1].prompt = "第一行：保留自定义指令。\n第二行：恢复完整内容🙂。"
+            customized.presets[1].shortcut = .init(keyCode: 40, modifiers: 6400, label: "⌃⌥⌘K")
+            let deleted = customized.presets[1]
+            editor.draft = customized
+            editor.flush()
+            await pause(120)
+            rejectsPresetSave = true
+            let failedDeletePressed = element("settings.preset.\(deleted.id).delete")?.press() == true
+            await pause(120)
+            checks["nativeDeleteSaveFailureKeepsPresetAndNoNotice"] = failedDeletePressed &&
+                editor.draft == customized && persisted == customized && editor.error != nil &&
+                element("settings.preset.deleted.notice") == nil
+            rejectsPresetSave = false
+            editor.flush()
+            let pressedDelete = element("settings.preset.\(deleted.id).delete")?.press() == true
+            await pause(120)
+            checks["nativePresetDeletionShowsUndoNotice"] = pressedDelete &&
+                !editor.draft.presets.contains(where: { $0.id == deleted.id }) &&
+                !persisted.presets.contains(where: { $0.id == deleted.id }) &&
+                element("settings.preset.deleted.notice") != nil && element("settings.preset.undoDelete") != nil
+            let afterDeletion = editor.draft
+            let noticeBeforeScroll = element("settings.preset.deleted.notice")?.frame ?? .zero
+            var pageScrollDistance: CGFloat = 0
+            if let last = editor.draft.presets.last,
+               let target = try? nativeTarget("settings.preset.\(last.id).name"),
+               let scroll = target.view.enclosingScrollView, let document = scroll.documentView {
+                let previousOffset = scroll.contentView.bounds.minY
+                scroll.contentView.scroll(to: NSPoint(x: 0, y: max(0, document.bounds.maxY - scroll.contentView.bounds.height)))
+                scroll.reflectScrolledClipView(scroll.contentView)
+                await pause(120)
+                pageScrollDistance = abs(scroll.contentView.bounds.minY - previousOffset)
+            }
+            let noticeAfterScroll = element("settings.preset.deleted.notice")?.frame ?? .zero
+            checks["presetDeletedNoticeRemainsVisibleOutsidePageScroll"] = pageScrollDistance > 30 && noticeBeforeScroll.height > 0 &&
+                noticeAfterScroll.height > 0 && window.frame.contains(noticeAfterScroll) &&
+                abs(noticeBeforeScroll.minY - noticeAfterScroll.minY) < 2
+            let chineseNotice = element("settings.preset.deleted.notice")?.text ?? ""
+            checks["deletedPresetChinesePreviewSaved"] = snapshot("preset-deleted-zh.png")
+            _ = element("settings.section.general")?.press()
+            await pause(80)
+            _ = element("settings.language.en")?.press()
+            await pause(80)
+            _ = element("settings.section.presets")?.press()
+            await pause(120)
+            let englishNotice = element("settings.preset.deleted.notice")?.text ?? ""
+            checks["deletedPresetEnglishPreviewSaved"] = snapshot("preset-deleted-en.png")
+            checks["deletedPresetNoticeChangesLanguageAndKeepsCustomName"] = !chineseNotice.isEmpty &&
+                englishNotice != chineseNotice && englishNotice.contains(deleted.name) && chineseNotice.contains(deleted.name)
+            _ = element("settings.section.general")?.press()
+            await pause(80)
+            _ = element("settings.language.zh-Hans")?.press()
+            await pause(80)
+            _ = element("settings.section.presets")?.press()
+            await pause(120)
+            checks["deletedPresetNoticeReturnsToOriginalLanguage"] =
+                element("settings.preset.deleted.notice")?.text == chineseNotice && editor.draft == afterDeletion
+            rejectsPresetSave = true
+            let failedUndoPressed = element("settings.preset.undoDelete")?.press() == true
+            await pause(120)
+            checks["nativeUndoSaveFailureKeepsDeletedStateAndRetry"] = failedUndoPressed &&
+                editor.draft == afterDeletion && persisted == afterDeletion && editor.error != nil &&
+                element("settings.preset.deleted.notice") != nil && element("settings.preset.undoDelete") != nil
+            rejectsPresetSave = false
+            let pressedUndo = element("settings.preset.undoDelete")?.press() == true
+            await pause(300)
+            checks["nativeUndoDeleteRestoresCompletePresetAndOrder"] = pressedUndo &&
+                editor.draft == customized && persisted == customized && editor.error == nil
+            let restoredNameID = "settings.preset.\(deleted.id).name"
+            let restoredFrame = element(restoredNameID)?.frame ?? .zero
+            checks["undoDeleteScrollsToRestoredNameAndFocusesIt"] = pressedUndo && restoredFrame.height > 0 &&
+                window.frame.contains(restoredFrame) && (try? focusedEditor(restoredNameID))?.string == deleted.name
+            checks["successfulUndoRemovesDeletedNotice"] = pressedUndo && element("settings.preset.deleted.notice") == nil
+            observations.append(["phase": "presetDeletionRecovery", "deletedID": deleted.id.uuidString,
+                "deletePressed": pressedDelete, "undoPressed": pressedUndo,
+                "draftCount": editor.draft.presets.count, "persistedCount": persisted.presets.count,
+                "completePresetRestored": editor.draft.presets.contains(deleted),
+                "chineseNotice": chineseNotice, "englishNotice": englishNotice,
+                "noticeFrameBeforeScroll": NSStringFromRect(noticeBeforeScroll),
+                "noticeFrameAfterScroll": NSStringFromRect(noticeAfterScroll),
+                "pageScrollDistance": pageScrollDistance,
+                "restoredNameFrame": NSStringFromRect(restoredFrame)])
+            _ = element("settings.preset.\(deleted.id).delete")?.press()
+            await pause(120)
+            let beforeDismiss = editor.draft
+            let dismissPressed = element("settings.preset.dismissDeleted")?.press() == true
+            await pause(80)
+            checks["dismissingDeletedNoticePreservesDeletion"] = dismissPressed &&
+                element("settings.preset.deleted.notice") == nil && element("settings.preset.undoDelete") == nil &&
+                editor.draft == beforeDismiss && persisted == beforeDismiss
+            editor.draft = original
+            editor.flush()
+            await pause(120)
+            let firstDeleted = original.presets[0]
+            let latestDeleted = original.presets[2]
+            _ = element("settings.preset.\(firstDeleted.id).delete")?.press()
+            await pause(120)
+            _ = element("settings.preset.\(latestDeleted.id).delete")?.press()
+            await pause(120)
+            let latestNotice = element("settings.preset.deleted.notice")?.text ?? ""
+            let undoLatest = element("settings.preset.undoDelete")?.press() == true
+            await pause(200)
+            var latestExpected = original
+            latestExpected.presets.removeAll { $0.id == firstDeleted.id }
+            checks["successivePresetDeletionsOfferOnlyLatestUndo"] = undoLatest && latestNotice.contains(latestDeleted.name) &&
+                editor.draft == latestExpected && persisted == latestExpected &&
+                element("settings.preset.undoDelete") == nil
+            _ = element("settings.preset.dismissDeleted")?.press()
+            editor.draft = original
+            editor.flush()
+            window.makeFirstResponder(window)
+            await pause(120)
+        }
+
+        func repeatedPresetAddition() async {
+            let original = editor.draft
+            var savedEveryAddition = true
+            var additionObservations: [[String: Any]] = []
+            for attempt in 1...6 {
+                let pressed = element("settings.preset.add")?.press() == true
+                await pause(100)
+                let unique = Set(editor.draft.presets.map { $0.shortcut.identity }).count == editor.draft.presets.count
+                savedEveryAddition = savedEveryAddition && pressed && unique && editor.draft == persisted &&
+                    editor.error == nil && editor.draft.presets.count == original.presets.count + attempt
+                additionObservations.append(["attempt": attempt, "pressed": pressed,
+                    "draftCount": editor.draft.presets.count, "persistedCount": persisted.presets.count,
+                    "uniqueShortcuts": unique, "error": editor.error ?? ""])
+            }
+            checks["sixNativePresetAdditionsPersistWithoutShortcutConflicts"] = savedEveryAddition
+            observations.append(["phase": "repeatedPresetAddition", "attempts": additionObservations])
+            _ = element("settings.preset.dismissDeleted")?.press()
+            var occupied = original
+            let digitCodes: [UInt32] = [18, 19, 20, 21, 23, 22, 26, 28, 25, 29]
+            occupied.presets = [UInt32(6144), UInt32(6656)].flatMap { modifiers in
+                digitCodes.enumerated().map { index, code in
+                    Preset(name: "占用 \(modifiers)-\(index)", prompt: "保留占用组合。",
+                        shortcut: .init(keyCode: code, modifiers: modifiers, label: "占用 \(index)"))
+                }
+            }
+            editor.draft = occupied
+            editor.flush()
+            await pause(120)
+            let exhaustedPressed = element("settings.preset.add")?.press() == true
+            await pause(120)
+            checks["nativeAddWhenAllTwentyShortcutsUsedKeepsConfiguration"] = exhaustedPressed &&
+                editor.draft == occupied && persisted == occupied && editor.error != nil
+            editor.draft = original
+            editor.flush()
+            window.makeFirstResponder(window)
+            await pause(120)
+            _ = element("settings.section.connection")?.press()
+            await pause(80)
+            _ = element("settings.section.presets")?.press()
+            await pause(120)
+        }
+
+        func snapshot(_ name: String) -> Bool {
+            guard let view = window.contentView?.superview,
+                  let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return false }
+            view.cacheDisplay(in: view.bounds, to: bitmap)
+            guard let data = bitmap.representation(using: .png, properties: [:]) else { return false }
+            do {
+                try FileManager.default.createDirectory(at: reportDirectory, withIntermediateDirectories: true)
+                try data.write(to: reportDirectory.appendingPathComponent(name), options: .atomic)
+                return true
+            } catch { return false }
         }
 
         func recorderWindowLifecycle(_ recorder: RecorderButton, shortcut: Shortcut) async {
@@ -751,6 +931,21 @@ import BigBangCore
 
     @MainActor private struct Accessible {
         let object: NSObject
+        var label: String? {
+            let selector = NSSelectorFromString("accessibilityLabel")
+            return object.responds(to: selector) ? object.perform(selector)?.takeUnretainedValue() as? String : nil
+        }
+        var text: String? {
+            // Native static text exposes its content as AXValue; buttons use AXLabel.
+            let selector = NSSelectorFromString("accessibilityValue")
+            return (object.responds(to: selector) ? object.perform(selector)?.takeUnretainedValue() as? String : nil) ?? label
+        }
+        var frame: NSRect {
+            let selector = NSSelectorFromString("accessibilityFrame")
+            guard object.responds(to: selector) else { return .zero }
+            typealias Frame = @convention(c) (AnyObject, Selector) -> NSRect
+            return unsafeBitCast(object.method(for: selector), to: Frame.self)(object, selector)
+        }
         func press() -> Bool {
             let selector = NSSelectorFromString("accessibilityPerformPress")
             guard object.responds(to: selector) else { return false }

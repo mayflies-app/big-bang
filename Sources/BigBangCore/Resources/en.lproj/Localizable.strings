@@ -40,6 +40,12 @@
 "删除%@预设" = "Delete %@ preset";
 "删除已保存的 API Key" = "Delete saved API key";
 "删除预设" = "Delete preset";
+"已删除“%@”" = "Deleted “%@”";
+"撤销删除" = "Undo Delete";
+"关闭撤销提示" = "Dismiss undo notification";
+"没有可用的预设快捷键，请先释放一个 Control + Option 数字组合。" = "No preset shortcut is available. Free a Control + Option number combination first.";
+"无法撤销删除：此预设已存在。" = "Cannot undo deletion: this preset already exists.";
+"无法撤销删除：原快捷键已被其他预设使用，请先更改该快捷键。" = "Cannot undo deletion: another preset uses its original shortcut. Change that shortcut first.";
 "前台应用已改变，请重新选择并触发。" = "The foreground app changed. Select the text and press the shortcut again.";
 "剪切" = "Cut";
 "取消置顶" = "Unpin";

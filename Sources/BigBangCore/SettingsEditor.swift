@@ -14,6 +14,7 @@ import Combine
     @Published public var apiKeyInput = "" { didSet { if oldValue != apiKeyInput { scheduleSave() } } }
     @Published public var hasKey: Bool
     @Published public var error: String?
+    @Published public private(set) var lastDeletedPreset: Preset?
     private let save: (Configuration, String) throws -> Void
     private let deleteKey: () throws -> Void
     private let saveDelay: Duration
@@ -23,6 +24,7 @@ import Combine
     private var deletingKey = false
     private var suppressDraftSave = false
     private var savingPresetTransaction = false
+    private var deletedPresetIndex: Int?
 
     public init(configuration: Configuration, hasKey: Bool = false, saveDelay: Duration = .milliseconds(300),
                 save: @escaping (Configuration, String) throws -> Void, deleteKey: @escaping () throws -> Void) {
@@ -53,6 +55,82 @@ import Combine
             error = nil
         } catch { self.error = error.localizedDescription }
     }
+    /// Adds a custom preset with a free shortcut, keeping an undoable shortcut free when possible.
+    @discardableResult public func addPreset() -> UUID? {
+        let occupied = Set(draft.presets.map { $0.shortcut.identity })
+        let available = Self.presetShortcutCandidates.filter { !occupied.contains($0.identity) }
+        let deletedShortcut = lastDeletedPreset?.shortcut.identity
+        guard let shortcut = available.first(where: { $0.identity != deletedShortcut }) ?? available.first else {
+            error = L10n.string("没有可用的预设快捷键，请先释放一个 Control + Option 数字组合。", language: draft.language)
+            return nil
+        }
+        let preset = Preset(name: L10n.string("新预设", language: draft.language),
+                            prompt: L10n.string("请处理用户提供的文本。", language: draft.language), shortcut: shortcut)
+        var candidate = draft
+        candidate.presets.append(preset)
+        return persistPresetTransaction(candidate) ? preset.id : nil
+    }
+    /// Deletes one preset and retains its complete contents and position for a single undo.
+    @discardableResult public func deletePreset(id: UUID) -> Bool {
+        guard let index = draft.presets.firstIndex(where: { $0.id == id }) else { return false }
+        guard draft.presets.count > 1 else {
+            error = L10n.string("至少保留一个预设。", language: draft.language)
+            return false
+        }
+        var candidate = draft
+        let deleted = candidate.presets.remove(at: index)
+        guard persistPresetTransaction(candidate) else { return false }
+        deletedPresetIndex = index
+        lastDeletedPreset = deleted
+        return true
+    }
+    /// Restores the last deletion without replacing later edits or remapping its original shortcut.
+    @discardableResult public func undoDeletePreset() -> UUID? {
+        guard let preset = lastDeletedPreset, let index = deletedPresetIndex else { return nil }
+        guard !draft.presets.contains(where: { $0.id == preset.id }) else {
+            error = L10n.string("无法撤销删除：此预设已存在。", language: draft.language)
+            return nil
+        }
+        guard !draft.presets.contains(where: { $0.shortcut.identity == preset.shortcut.identity }) else {
+            error = L10n.string("无法撤销删除：原快捷键已被其他预设使用，请先更改该快捷键。", language: draft.language)
+            return nil
+        }
+        var candidate = draft
+        candidate.presets.insert(preset, at: min(index, candidate.presets.count))
+        guard persistPresetTransaction(candidate) else { return nil }
+        dismissDeletedPreset()
+        return preset.id
+    }
+    public func dismissDeletedPreset() {
+        lastDeletedPreset = nil
+        deletedPresetIndex = nil
+    }
+    private func persistPresetTransaction(_ candidate: Configuration) -> Bool {
+        do { try candidate.validate() } catch { self.error = error.localizedDescription; return false }
+        let previousDraft = draft
+        defer {
+            // A preset save must leave credential text to its own debounce, including after rollback.
+            let pendingKey = apiKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !pendingKey.isEmpty && pendingKey != savedKeyInput { scheduleSave() }
+        }
+        savingPresetTransaction = true
+        draft = candidate
+        savingPresetTransaction = false
+        guard error == nil else {
+            suppressDraftSave = true; draft = previousDraft; suppressDraftSave = false
+            return false
+        }
+        return true
+    }
+    private static let presetShortcutCandidates: [Shortcut] = {
+        let digitCodes: [UInt32] = [18, 19, 20, 21, 23, 22, 26, 28, 25, 29]
+        return [UInt32(6144), UInt32(6656)].flatMap { modifiers in
+            digitCodes.enumerated().map { index, keyCode in
+                Shortcut(keyCode: keyCode, modifiers: modifiers,
+                         label: "⌃⌥\(modifiers == 6656 ? "⇧" : "")\((index + 1) % 10)")
+            }
+        }
+    }()
     /// Updates only untouched default content; identity, order, shortcuts, and custom edits survive.
     @discardableResult public func changeLanguage(to language: AppLanguage) -> Bool {
         guard language != draft.language else { return true }
@@ -89,17 +167,10 @@ import Combine
         var candidate = draft
         var added: [UUID] = []
         var occupied = Set(candidate.presets.map { $0.shortcut.identity })
-        let digitCodes: [UInt32] = [18, 19, 20, 21, 23, 22, 26, 28, 25, 29]
-        let fallbackShortcuts = [UInt32(6144), UInt32(6656)].flatMap { modifiers in
-            digitCodes.enumerated().map { index, keyCode in
-                Shortcut(keyCode: keyCode, modifiers: modifiers,
-                         label: "⌃⌥\(modifiers == 6656 ? "⇧" : "")\((index + 1) % 10)")
-            }
-        }
         for var preset in Preset.defaults(for: candidate.language) {
             guard !candidate.presets.contains(where: { $0.builtIn == preset.builtIn || $0.id == preset.id }) else { continue }
             if occupied.contains(preset.shortcut.identity) {
-                guard let available = fallbackShortcuts.first(where: { !occupied.contains($0.identity) }) else {
+                guard let available = Self.presetShortcutCandidates.first(where: { !occupied.contains($0.identity) }) else {
                     error = L10n.string("没有可用的恢复快捷键，请先释放一个 Control + Option 数字组合。", language: candidate.language)
                     return []
                 }

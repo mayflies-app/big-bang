@@ -164,7 +164,7 @@ private final class RecorderTitleLabel: NSTextField {
     let onRecordingChange: (Bool) -> Void
     let timer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
     private enum Field: Hashable { case key, model, endpoint, presetName(UUID), prompt(UUID) }
-    private enum Action: Hashable { case preview, add, restore, permission, loginSettings, languageChinese, languageEnglish, deleteKey, deletePreset(UUID), movePresetUp(UUID), movePresetDown(UUID), apiResponses, apiChatCompletions }
+    private enum Action: Hashable { case preview, add, restore, undoDelete, dismissDeleted, permission, loginSettings, languageChinese, languageEnglish, deleteKey, deletePreset(UUID), movePresetUp(UUID), movePresetDown(UUID), apiResponses, apiChatCompletions }
     enum Section: String, CaseIterable, Identifiable {
         case general = "常规"
         case connection = "模型服务", presets = "处理预设", selection = "文本读取"
@@ -216,6 +216,9 @@ private final class RecorderTitleLabel: NSTextField {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, 28).padding(.vertical, 12)
                         .accessibilityIdentifier("settings.error")
+                }
+                if section == .presets, let deleted = editor.lastDeletedPreset {
+                    deletedPresetNotice(deleted)
                 }
                 ScrollViewReader { proxy in
                     ScrollView {
@@ -491,7 +494,7 @@ private final class RecorderTitleLabel: NSTextField {
                             .frame(width: 104, height: 36)
                             .accessibilityLabel(trFormat("%@的快捷键", preset.name))
                             .accessibilityIdentifier("settings.preset.\(preset.id).shortcut")
-                        Button { let id = preset.id; editor.draft.presets.removeAll { $0.id == id } } label: {
+                        Button { deletePreset(preset.id) } label: {
                             Image(systemName: "trash").frame(width: 16)
                         }.buttonStyle(SettingsButtonStyle(palette: palette, focused: focusedAction == .deletePreset(preset.id)))
                             .focused($focusedAction, equals: .deletePreset(preset.id))
@@ -531,6 +534,29 @@ private final class RecorderTitleLabel: NSTextField {
                 .font(.system(size: 11)).foregroundStyle(palette.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
+    }
+
+    private func deletedPresetNotice(_ preset: Preset) -> some View {
+        HStack(spacing: 10) {
+            Text(trFormat("已删除“%@”", preset.name))
+                .font(.system(size: 12)).lineLimit(2)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityIdentifier("settings.preset.deleted.notice")
+            Button(tr("撤销删除")) { undoDeletePreset() }
+                .buttonStyle(SettingsButtonStyle(palette: palette, focused: focusedAction == .undoDelete))
+                .focused($focusedAction, equals: .undoDelete)
+                .accessibilityIdentifier("settings.preset.undoDelete")
+            Button { editor.dismissDeletedPreset() } label: {
+                Image(systemName: "xmark").font(.system(size: 11, weight: .medium)).frame(width: 12)
+            }
+            .buttonStyle(SettingsButtonStyle(palette: palette, focused: focusedAction == .dismissDeleted))
+            .focused($focusedAction, equals: .dismissDeleted)
+            .help(tr("关闭撤销提示")).accessibilityLabel(tr("关闭撤销提示"))
+            .accessibilityIdentifier("settings.preset.dismissDeleted")
+        }
+        .padding(.horizontal, 28).padding(.vertical, 10)
+        .background(palette.field)
+        .overlay(alignment: .bottom) { Rectangle().fill(palette.border).frame(height: 1).allowsHitTesting(false) }
     }
 
     private var selectionPane: some View {
@@ -606,15 +632,21 @@ private final class RecorderTitleLabel: NSTextField {
         newPresetID = firstID
         presetRevealRequest = UUID()
     }
+    private func deletePreset(_ id: UUID) {
+        guard editor.deletePreset(id: id) else { return }
+        focusedField = nil
+        focusedAction = .undoDelete
+    }
+    private func undoDeletePreset() {
+        guard let id = editor.undoDeletePreset() else { return }
+        focusedAction = nil
+        newPresetID = id
+        presetRevealRequest = UUID()
+    }
     private func addPreset() {
-        let choices: [(UInt32, String)] = [(21, "4"), (23, "5"), (22, "6"), (26, "7"), (28, "8"), (25, "9"), (29, "0")]
-        let used = Set(editor.draft.presets.map { $0.shortcut.identity })
-        let choice = choices.first { !used.contains("\($0.0):6144") } ?? (21, "4")
-        let preset = Preset(name: tr("新预设"), prompt: tr("请处理用户提供的文本。"),
-                            shortcut: .init(keyCode: choice.0, modifiers: 6144, label: "⌃⌥" + choice.1))
-        editor.draft.presets.append(preset)
+        guard let id = editor.addPreset() else { return }
         section = .presets
-        newPresetID = preset.id
+        newPresetID = id
         presetRevealRequest = UUID()
     }
 }

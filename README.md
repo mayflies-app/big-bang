@@ -66,6 +66,8 @@ These are configuration examples; compatibility depends on the service. Do not i
 
 Settings groups General, Model Service, Presets and Text Reading. Choose **简体中文** or **English** to update the interface immediately. Launch at Login reflects the system's actual state and offers a link to Login Items when approval is needed. Login launches stay in the menu bar.
 
+Deleting a preset shows **Undo Delete**, which restores the most recently deleted preset's content, shortcut and position. The notice stays until dismissed, undone or replaced by another deletion; it is not retained after quitting the app. New presets receive an available Control–Option number shortcut, adding Shift when needed. If all automatic combinations are in use, the app keeps the current list and asks you to free a shortcut.
+
 Notes use native Liquid Glass on macOS 26 and later, with a system material fallback on older versions or with Reduce Transparency enabled. Preview Note is an offline UI demonstration.
 
 ## Privacy
