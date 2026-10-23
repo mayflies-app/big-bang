@@ -218,6 +218,7 @@ struct StickyView: View {
                 if running { copyFeedback?.cancel(); copied = false }
             }
             .onChange(of: model.preset.id) { _, _ in copyFeedback?.cancel(); copied = false }
+            .onChange(of: model.output) { _, _ in copyFeedback?.cancel(); copied = false }
             .onChange(of: model.awaitingInput) { _, editing in
                 if editing { copyFeedback?.cancel(); copied = false }
             }

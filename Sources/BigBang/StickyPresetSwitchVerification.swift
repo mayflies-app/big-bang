@@ -332,6 +332,8 @@ extension StickyPresetSwitchVerification {
         let editReturn = await verifyEditReturnToResult(reportURL: reportURL)
         checks.merge(editReturn.checks) { _, new in new }
         diagnostics.merge(editReturn.diagnostics) { _, new in new }
+        let copyFeedback = await verifyCopyFeedback()
+        checks.merge(copyFeedback) { _, new in new }
         if let frontmostApplication {
             frontmostApplication.activate(options: [])
             checks["editReturn.restoresOriginalForegroundApplication"] = await waitFor {
@@ -977,7 +979,7 @@ extension StickyPresetSwitchVerification {
         let report: [String: Any] = ["passed": !checks.isEmpty && checks.values.allSatisfy { $0 } && errors.isEmpty,
             "checks": checks, "errors": errors, "requestCount": requests.count,
             "diagnostics": diagnostics,
-            "scope": "Packaged nonactivating panel; production selection-to-note path with injected selection failures and request sink; native editor composition, private-pasteboard paste, accessibility submit/cancel-edit and NSApp.sendEvent keyboard routing. Cancel-edit verifies restored result snapshots and stopped-stream isolation. An explicitly supplied loopback endpoint additionally exercises both real streaming API clients. Conditional nativeAX checks run only with --fixture-app: real AX-only SelectionReader against an owned foreground ExternalSelectionFixture, without sending copy. No live model, Keychain access, global hotkey registration or settings writes. Installed IME candidate UI and physical hotkey are not exercised."]
+            "scope": "Packaged nonactivating panel; production selection-to-note path with injected selection failures and request sink; native editor composition, private-pasteboard paste, accessibility submit/cancel-edit and NSApp.sendEvent keyboard routing. Cancel-edit verifies restored result snapshots and stopped-stream isolation. Copy feedback uses deterministic published output deltas; the general clipboard is fully materialized by item/type before copying and restored byte-for-byte only if no external write is detected. An explicitly supplied loopback endpoint additionally exercises both real streaming API clients. Conditional nativeAX checks run only with --fixture-app: real AX-only SelectionReader against an owned foreground ExternalSelectionFixture, without sending copy. No live model, Keychain access, global hotkey registration or settings writes. Installed IME candidate UI and physical hotkey are not exercised."]
         do {
             try FileManager.default.createDirectory(at: reportURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]).write(to: reportURL, options: .atomic)
@@ -1220,6 +1222,89 @@ extension StickyPresetSwitchVerification {
         let selector = NSSelectorFromString("accessibilityLabel")
         guard object.responds(to: selector) else { return nil }
         return object.perform(selector)?.takeUnretainedValue() as? String
+    }
+
+    /// Copy feedback is a view boundary: deterministic published stream deltas avoid the
+    /// 1.5 second confirmation timeout masking whether a new delta clears the confirmation.
+    private static func verifyCopyFeedback() async -> [String: Bool] {
+        var checks: [String: Bool] = [:]
+        let board = NSPasteboard.general
+        let initialCount = board.changeCount
+        var saved: [[NSPasteboard.PasteboardType: Data]] = []
+        // Materialize every representation before mutating the shared clipboard. An unreadable
+        // promised type or concurrent external write makes this fixture read-only.
+        for item in board.pasteboardItems ?? [] {
+            var representations: [NSPasteboard.PasteboardType: Data] = [:]
+            for type in item.types {
+                guard let data = item.data(forType: type) else {
+                    return ["copyFeedback.clipboardSnapshotComplete": false]
+                }
+                representations[type] = data
+            }
+            saved.append(representations)
+        }
+        checks["copyFeedback.clipboardSnapshotComplete"] = board.changeCount == initialCount
+        guard board.changeCount == initialCount else { return checks }
+        var ownedCount = initialCount
+        var expectedClipboard: String?
+        var externalChange = false
+        for language in AppLanguage.allCases {
+            let prefix = "copyFeedback." + language.rawValue + "."
+            let note = StickyWindow(preset: Preset.defaults[0], source: "Copy fixture", offset: 0)
+            defer { note.window?.close() }
+            note.setLanguage(to: language)
+            note.model.running = true
+            note.model.output = "First streamed fragment"
+            note.showWindow(nil)
+            _ = await waitFor { element(in: note.window, identifier: "sticky.copy") != nil }
+            guard board.changeCount == ownedCount else { externalChange = true; break }
+            let copied = await press(in: note.window, identifier: "sticky.copy")
+            ownedCount = board.changeCount
+            expectedClipboard = "First streamed fragment"
+            checks[prefix + "copyTakesClickTimeSnapshot"] = copied && board.string(forType: .string) == expectedClipboard
+            checks[prefix + "copyConfirmsInCurrentLanguage"] = await waitFor {
+                element(in: note.window, identifier: "sticky.copy").flatMap(accessibilityLabel) ==
+                    L10n.string("已复制", language: language)
+            }
+            let changedAt = ProcessInfo.processInfo.systemUptime
+            note.model.output += "\nLater streamed fragment"
+            // Allow a normal SwiftUI update, while keeping the deadline well below feedback expiry.
+            for _ in 0..<20 {
+                if element(in: note.window, identifier: "sticky.copy").flatMap(accessibilityLabel) == L10n.string("复制", language: language) { break }
+                try? await Task.sleep(for: .milliseconds(20))
+            }
+            checks[prefix + "newStreamDeltaClearsCopyConfirmation"] =
+                ProcessInfo.processInfo.systemUptime - changedAt < 0.8 &&
+                element(in: note.window, identifier: "sticky.copy").flatMap(accessibilityLabel) == L10n.string("复制", language: language)
+            guard board.changeCount == ownedCount, board.string(forType: .string) == expectedClipboard else {
+                externalChange = true; break
+            }
+            checks[prefix + "streamDeltaDoesNotRewriteClipboard"] = true
+            let recopied = await press(in: note.window, identifier: "sticky.copy")
+            ownedCount = board.changeCount
+            expectedClipboard = note.model.output
+            checks[prefix + "secondCopyGetsFullCurrentOutput"] = recopied && board.string(forType: .string) == expectedClipboard
+            note.window?.close()
+        }
+        // Never overwrite a clipboard modified outside the actions owned by this fixture.
+        if !externalChange && board.changeCount == ownedCount &&
+            (expectedClipboard == nil || board.string(forType: .string) == expectedClipboard) {
+            let restored = saved.map { representations in
+                let item = NSPasteboardItem()
+                for (type, data) in representations { item.setData(data, forType: type) }
+                return item
+            }
+            board.clearContents()
+            let wrote = restored.isEmpty || board.writeObjects(restored)
+            let actual = (board.pasteboardItems ?? []).map { item in
+                Dictionary(uniqueKeysWithValues: item.types.compactMap { type in item.data(forType: type).map { (type, $0) } })
+            }
+            checks["copyFeedback.restoresEveryClipboardRepresentation"] = wrote && actual == saved
+        } else {
+            checks["copyFeedback.externalClipboardChangeDetected"] = true
+            checks["copyFeedback.restoresEveryClipboardRepresentation"] = false
+        }
+        return checks
     }
 
     private static func inputLayoutFits(_ note: StickyWindow, editor: SettingsEditingTextView) -> Bool {
