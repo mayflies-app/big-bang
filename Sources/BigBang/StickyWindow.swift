@@ -19,6 +19,16 @@ import BigBangNetworking
     @Published var autoScroll = true
     @Published var contentOverflows = false
     @Published var language = L10n.currentLanguage
+    private struct ResultSnapshot {
+        let preset: Preset
+        let source: String
+        let output: String
+        let state: String
+        let error: String?
+        let autoScroll: Bool
+    }
+    @Published private var resultBeforeEditing: ResultSnapshot?
+    var canReturnToResult: Bool { resultBeforeEditing != nil }
     var displayedState: String { L10n.string(capturingSelection ? "读取选区…" : state, language: language) }
     var displayedError: String? { error.map { RuntimeTranslations.message($0, language: language) } }
     var displayedPresetName: String {
@@ -30,6 +40,7 @@ import BigBangNetworking
     let service = ModelStream()
     var submit: (() -> Void)?
     var editInput: (() -> Void)?
+    var cancelEdit: (() -> Void)?
     var retry: (() -> Void)?
     var selectPreset: ((UUID) -> Void)?
     var close: (() -> Void)?
@@ -45,7 +56,36 @@ import BigBangNetworking
         capturingSelection = false
     }
     func beginManualInput() { awaitingInput = true }
-    func acceptInput(_ text: String) { source = text; awaitingInput = false }
+    func acceptInput(_ text: String) {
+        resultBeforeEditing = nil
+        source = text
+        awaitingInput = false
+    }
+    func editResult() {
+        guard !awaitingInput && !capturingSelection else { return }
+        // A partial result can be restored, but its cancelled request must stay stopped.
+        if running { stop() } else { service.cancel() }
+        resultBeforeEditing = ResultSnapshot(preset: preset, source: source, output: output,
+                                            state: state, error: error, autoScroll: autoScroll)
+        draft = source
+        output = ""
+        error = nil
+        autoScroll = true
+        contentOverflows = false
+        awaitingInput = true
+    }
+    func restoreResult() {
+        guard awaitingInput, let result = resultBeforeEditing else { return }
+        preset = result.preset
+        source = result.source
+        output = result.output
+        state = result.state
+        error = result.error
+        autoScroll = result.autoScroll
+        draft = ""
+        awaitingInput = false
+        resultBeforeEditing = nil
+    }
     func updatePresets(_ presets: [Preset]) {
         availablePresets = presets
         if let current = presets.first(where: { $0.id == preset.id }) { preset = current }
@@ -223,9 +263,21 @@ private struct StickyInputView: View {
                                   lineWidth: editorFocus.wrappedValue ? 1.5 : 1)
                     .allowsHitTesting(false))
             HStack(spacing: 12) {
-                if clipboardAccess.isBusy {
-                    Text(L10n.string("剪贴板恢复中…", language: model.language))
-                        .font(.system(size: 11)).foregroundStyle(palette.secondary)
+                VStack(alignment: .leading, spacing: 4) {
+                    if model.canReturnToResult {
+                        Button { model.cancelEdit?() } label: {
+                            Text(L10n.string("返回结果", language: model.language))
+                                .padding(.horizontal, 4).frame(minHeight: 28)
+                                .contentShape(Rectangle())
+                        }
+                            .buttonStyle(.borderless).controlSize(.large)
+                            .font(.system(size: 12)).foregroundStyle(palette.secondary)
+                            .accessibilityIdentifier("sticky.cancel-edit")
+                    }
+                    if clipboardAccess.isBusy {
+                        Text(L10n.string("剪贴板恢复中…", language: model.language))
+                            .font(.system(size: 11)).foregroundStyle(palette.secondary)
+                    }
                 }
                 Spacer(minLength: 0)
                 Button { model.submit?() } label: {
@@ -511,14 +563,13 @@ final class StickyPanel: NSPanel, TextEditorFocusWindow {
         }
         model.editInput = { [weak self] in
             guard let self, !self.model.awaitingInput, !self.model.capturingSelection else { return }
-            self.model.stop()
-            self.model.draft = self.model.source
-            self.model.output = ""
-            self.model.error = nil
-            self.model.autoScroll = true
-            self.model.contentOverflows = false
-            self.model.beginManualInput()
+            self.model.editResult()
             self.window?.makeKeyAndOrderFront(nil)
+        }
+        model.cancelEdit = { [weak self] in
+            guard let self else { return }
+            self.model.restoreResult()
+            self.setLanguage(to: self.model.language)
         }
         model.selectPreset = { [weak self] id in
             guard let self, id != self.model.preset.id else { return }

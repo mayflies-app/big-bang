@@ -309,7 +309,8 @@ extension StickyPresetSwitchVerification {
         } else {
             diagnostics["nativeAX.included"] = false
         }
-        let frontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let frontmostApplication = NSWorkspace.shared.frontmostApplication
+        let frontmost = frontmostApplication?.processIdentifier
         var configuration = Configuration(language: .simplifiedChinese)
         configuration.model = "fixture-model"
         let a = configuration.presets[0], b = configuration.presets[1]
@@ -327,6 +328,15 @@ extension StickyPresetSwitchVerification {
             note.model.output = "Fixture result"
             note.model.error = nil
             note.model.running = false
+        }
+        let editReturn = await verifyEditReturnToResult(reportURL: reportURL)
+        checks.merge(editReturn.checks) { _, new in new }
+        diagnostics.merge(editReturn.diagnostics) { _, new in new }
+        if let frontmostApplication {
+            frontmostApplication.activate(options: [])
+            checks["editReturn.restoresOriginalForegroundApplication"] = await waitFor {
+                NSWorkspace.shared.frontmostApplication?.processIdentifier == frontmost
+            }
         }
         // Hold selection open so this verifies the actual presentation boundary rather than
         // relying on how quickly a particular machine completes Accessibility/clipboard work.
@@ -967,7 +977,7 @@ extension StickyPresetSwitchVerification {
         let report: [String: Any] = ["passed": !checks.isEmpty && checks.values.allSatisfy { $0 } && errors.isEmpty,
             "checks": checks, "errors": errors, "requestCount": requests.count,
             "diagnostics": diagnostics,
-            "scope": "Packaged nonactivating panel; production selection-to-note path with injected selection failures and request sink; native editor composition, private-pasteboard paste, accessibility submit and NSApp.sendEvent keyboard routing. An explicitly supplied loopback endpoint additionally exercises both real streaming API clients. Conditional nativeAX checks run only with --fixture-app: real AX-only SelectionReader against an owned foreground ExternalSelectionFixture, without sending copy. No live model, Keychain access, global hotkey registration or settings writes. Installed IME candidate UI and physical hotkey are not exercised."]
+            "scope": "Packaged nonactivating panel; production selection-to-note path with injected selection failures and request sink; native editor composition, private-pasteboard paste, accessibility submit/cancel-edit and NSApp.sendEvent keyboard routing. Cancel-edit verifies restored result snapshots and stopped-stream isolation. An explicitly supplied loopback endpoint additionally exercises both real streaming API clients. Conditional nativeAX checks run only with --fixture-app: real AX-only SelectionReader against an owned foreground ExternalSelectionFixture, without sending copy. No live model, Keychain access, global hotkey registration or settings writes. Installed IME candidate UI and physical hotkey are not exercised."]
         do {
             try FileManager.default.createDirectory(at: reportURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]).write(to: reportURL, options: .atomic)
@@ -1037,6 +1047,179 @@ extension StickyPresetSwitchVerification {
     private static func input(in view: NSView) -> SettingsEditingTextView? {
         if let text = view as? SettingsEditingTextView, text.accessibilityIdentifier() == "sticky.input" { return text }
         return view.subviews.lazy.compactMap { input(in: $0) }.first
+    }
+
+    /// Independent snapshots keep cancellation assertions from depending on earlier fixture edits.
+    private static func verifyEditReturnToResult(reportURL: URL) async ->
+        (checks: [String: Bool], diagnostics: [String: Any]) {
+        var checks: [String: Bool] = [:]
+        var diagnostics: [String: Any] = [:]
+        for language in AppLanguage.allCases {
+            let prefix = "editReturn." + language.rawValue + "."
+            let configuration = Configuration(language: language)
+            let original = configuration.presets[0], alternative = configuration.presets[1]
+            let source = "  Original question🙂\n原始问题  "
+            let output = "Original result\n原始结果"
+            let originalError = "Fixture retained error"
+            let note = StickyWindow(preset: original, source: source, offset: 0)
+            defer { note.window?.close() }
+            var requests = 0, reads = 0
+            var rejectKey = true
+            note.configureProcessing(configuration: { configuration }, readKey: {
+                reads += 1
+                if rejectKey { throw ValidationError("Fixture credential unavailable") }
+                return "fixture-key"
+            }, start: { sticky, _, _ in
+                requests += 1
+                sticky.model.output = "New submitted result"
+                sticky.model.error = nil
+                sticky.model.state = "已完成"
+                sticky.model.running = false
+            })
+            note.updateConfiguration(configuration)
+            note.model.output = output
+            note.model.error = originalError
+            note.model.state = "请求失败"
+            note.model.autoScroll = false
+            note.showWindow(nil)
+            note.window?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            checks[prefix + "opensEditor"] = await press(in: note.window, identifier: "sticky.arrow.uturn.backward")
+            guard await waitFor({ input(in: note.hostingView) != nil }), let editor = input(in: note.hostingView) else {
+                checks[prefix + "editorAvailable"] = false
+                continue
+            }
+            editor.insertText("Discard this unsubmitted draft", replacementRange: NSRange(location: 0, length: editor.string.utf16.count))
+            _ = await waitFor { note.model.draft == "Discard this unsubmitted draft" }
+            let switched = popup(in: note.hostingView).map { select(alternative.id, in: $0) } == true
+            checks[prefix + "draftPresetChangeDoesNotReadOrRequest"] = switched &&
+                note.model.preset.id == alternative.id && reads == 0 && requests == 0
+            let failedSubmission = await press(in: note.window, identifier: "sticky.submit")
+            checks[prefix + "credentialFailureRemainsEditable"] = failedSubmission && reads == 1 && requests == 0 &&
+                note.model.awaitingInput && note.model.error != nil
+            // Input AX children can appear before the deferred panel resize runs. Wait for
+            // visible controls and stable geometry rather than measuring the old result frame.
+            var previousGeometry: [NSRect] = []
+            var stableLayouts = 0
+            checks[prefix + "cancelLabelAndLayout"] = await waitFor {
+                note.hostingView.layoutSubtreeIfNeeded()
+                guard let window = note.window,
+                      let cancel = element(in: window, identifier: "sticky.cancel-edit"),
+                      let submit = element(in: window, identifier: "sticky.submit"),
+                      let scroll = editor.enclosingScrollView else { return false }
+                let inputFrame = window.convertToScreen(scroll.convert(scroll.bounds, to: nil))
+                let cancelFrame = frame(cancel), submitFrame = frame(submit)
+                let geometry = [window.frame, inputFrame, cancelFrame, submitFrame]
+                stableLayouts = geometry == previousGeometry ? stableLayouts + 1 : 0
+                previousGeometry = geometry
+                return stableLayouts >= 3 &&
+                    accessibilityLabel(cancel) == (language == .english ? "Back to Result" : "返回结果") &&
+                    window.frame.contains(cancelFrame) && cancelFrame.width >= 50 && cancelFrame.height >= 20 &&
+                    inputLayoutFits(note, editor: editor)
+            }
+            let cancel = element(in: note.window, identifier: "sticky.cancel-edit")
+            let scrollFrame = editor.enclosingScrollView.flatMap { scroll in
+                note.window.map { $0.convertToScreen(scroll.convert(scroll.bounds, to: nil)) }
+            }
+            diagnostics[prefix + "inputLayout"] = [
+                "windowFrame": note.window.map { NSStringFromRect($0.frame) } ?? "nil",
+                "editorFrame": note.window.map { NSStringFromRect($0.convertToScreen(editor.convert(editor.bounds, to: nil))) } ?? "nil",
+                "editorScrollFrame": scrollFrame.map(NSStringFromRect) ?? "nil",
+                "cancelFrame": cancel.map { NSStringFromRect(frame($0)) } ?? "nil",
+                "cancelLabel": cancel.flatMap(accessibilityLabel) ?? "nil",
+                "submitFrame": element(in: note.window, identifier: "sticky.submit").map { NSStringFromRect(frame($0)) } ?? "nil",
+                "stableLayoutPolls": stableLayouts
+            ]
+            checks[prefix + "inputScreenshotSaved"] = snapshot(note.window,
+                url: reportURL.deletingLastPathComponent().appendingPathComponent("edit-return-\(language.rawValue).png"))
+            let cancelled = cancel != nil ? await press(in: note.window, identifier: "sticky.cancel-edit") : false
+            checks[prefix + "cancelRestoresCompleteOriginalSnapshot"] = cancelled && !note.model.awaitingInput &&
+                note.model.source == source && note.model.preset == original && note.model.output == output &&
+                note.model.error == originalError && note.model.state == "请求失败" && !note.model.autoScroll && !note.model.running
+            checks[prefix + "cancelDoesNotReadCredentialsOrRequest"] = cancelled && reads == 1 && requests == 0
+            let resultReady = await waitFor {
+                input(in: note.hostingView) == nil && element(in: note.window, identifier: "sticky.arrow.clockwise") != nil &&
+                    element(in: note.window, identifier: "sticky.cancel-edit") == nil
+            }
+            checks[prefix + "resultActionsReturn"] = cancelled && resultReady
+            guard cancelled else { continue }
+            _ = await press(in: note.window, identifier: "sticky.arrow.uturn.backward")
+            checks[prefix + "reopeningDiscardsCancelledDraft"] = await waitFor {
+                note.model.draft == source && input(in: note.hostingView)?.string == source
+            }
+            guard let replacement = input(in: note.hostingView) else { continue }
+            let newSource = "New submitted question🙂"
+            replacement.insertText(newSource, replacementRange: NSRange(location: 0, length: replacement.string.utf16.count))
+            _ = await waitFor { note.model.draft == newSource }
+            rejectKey = false
+            _ = await press(in: note.window, identifier: "sticky.submit")
+            checks[prefix + "successfulSubmissionCreatesNewResult"] = requests == 1 && reads == 2 &&
+                note.model.source == newSource && note.model.output == "New submitted result" && !note.model.awaitingInput
+            _ = await press(in: note.window, identifier: "sticky.arrow.uturn.backward")
+            _ = await waitFor { input(in: note.hostingView) != nil }
+            let cancelledNew = await press(in: note.window, identifier: "sticky.cancel-edit")
+            checks[prefix + "nextCancelRestoresNewSubmission"] = cancelledNew && !note.model.awaitingInput &&
+                note.model.source == newSource && note.model.output == "New submitted result" && note.model.error == nil &&
+                note.model.state == "已完成" && requests == 1 && reads == 2
+            diagnostics[prefix + "requests"] = requests
+            diagnostics[prefix + "credentialReads"] = reads
+        }
+        let empty = StickyWindow(preset: Preset.defaults[0], source: "", offset: 0)
+        empty.showWindow(nil)
+        _ = await waitFor { input(in: empty.hostingView) != nil }
+        checks["editReturn.initialEmptyInputHasNoReturnAction"] = empty.model.awaitingInput &&
+            element(in: empty.window, identifier: "sticky.cancel-edit") == nil
+        empty.window?.close()
+        if let index = CommandLine.arguments.firstIndex(of: "--test-base-url"), CommandLine.arguments.count > index + 1,
+           let url = URL(string: CommandLine.arguments[index + 1]), url.scheme == "http", url.host == "127.0.0.1" {
+            for mode in APIMode.allCases {
+                let prefix = "editReturn.streaming." + mode.rawValue + "."
+                let original = Preset(name: "Slow fixture", prompt: "fixture-preset-A", shortcut: Preset.defaults[0].shortcut)
+                let alternative = Preset(name: "Other fixture", prompt: "fixture-preset-B", shortcut: Preset.defaults[1].shortcut)
+                var configuration = Configuration(language: .simplifiedChinese)
+                configuration.apiBaseURL = url.absoluteString
+                configuration.apiMode = mode
+                configuration.model = "test-model"
+                configuration.presets = [original, alternative]
+                let note = StickyWindow(preset: original, source: "preset-switch-input", offset: 0)
+                defer { note.window?.close() }
+                var reads = 0, starts = 0
+                note.configureProcessing(configuration: { configuration }, readKey: { reads += 1; return "fixture-key" },
+                    start: { sticky, config, key in
+                        starts += 1
+                        sticky.model.start(configuration: config, key: key)
+                    })
+                note.updateConfiguration(configuration)
+                note.showWindow(nil)
+                note.model.retry?()
+                checks[prefix + "slowStreamStarts"] = await waitFor { note.model.running && note.model.output == "A first" }
+                let partial = note.model.output
+                let edited = await press(in: note.window, identifier: "sticky.arrow.uturn.backward")
+                _ = await waitFor { input(in: note.hostingView) != nil }
+                if let editor = input(in: note.hostingView) {
+                    editor.insertText("Unsubmitted running edit", replacementRange: NSRange(location: 0, length: editor.string.utf16.count))
+                }
+                let switched = popup(in: note.hostingView).map { select(alternative.id, in: $0) } == true
+                checks[prefix + "editingStopsStreamWithoutRequest"] = edited && switched &&
+                    note.model.awaitingInput && !note.model.running && starts == 1 && reads == 1
+                let cancelled = element(in: note.window, identifier: "sticky.cancel-edit") != nil ?
+                    await press(in: note.window, identifier: "sticky.cancel-edit") : false
+                checks[prefix + "cancelRestoresStoppedPartialOutput"] = cancelled && !note.model.awaitingInput &&
+                    !note.model.running && note.model.output == partial && partial == "A first" &&
+                    note.model.state == "已停止" && note.model.preset == original && note.model.source == "preset-switch-input"
+                try? await Task.sleep(for: .milliseconds(1400))
+                checks[prefix + "lateStreamCannotMutateRestoredResult"] = cancelled && note.model.output == partial &&
+                    note.model.state == "已停止" && !note.model.running && note.model.error == nil && starts == 1 && reads == 1
+                diagnostics[prefix + "starts"] = starts
+            }
+        }
+        return (checks, diagnostics)
+    }
+
+    private static func accessibilityLabel(_ object: NSObject) -> String? {
+        let selector = NSSelectorFromString("accessibilityLabel")
+        guard object.responds(to: selector) else { return nil }
+        return object.perform(selector)?.takeUnretainedValue() as? String
     }
 
     private static func inputLayoutFits(_ note: StickyWindow, editor: SettingsEditingTextView) -> Bool {

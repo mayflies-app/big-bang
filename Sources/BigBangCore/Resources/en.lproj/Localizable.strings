@@ -151,6 +151,7 @@
 "选择的内容不是文本，或复制尚未完成。" = "The selection is not text, or copying has not finished.";
 "重试" = "Retry";
 "回退并编辑" = "Back to Edit";
+"返回结果" = "Back to Result";
 "钥匙串操作失败（%@）。请检查系统钥匙串授权。" = "Keychain operation failed (%@). Check your Keychain permissions.";
 "需要授权" = "Permission Required";
 "预览便签" = "Preview Note";
