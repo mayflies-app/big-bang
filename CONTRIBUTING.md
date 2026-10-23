@@ -10,7 +10,7 @@ Follow [Development](docs/development.md) to build and run the app. Read [Locali
 
 Preserve accessory-app focus, nonactivating notes, preset UUIDs, original-input retry and cancellation, native input methods, global shortcuts, selection fallback and restoration of every clipboard format. Changing the interface language must preserve customized presets and generated note content. Keep API keys out of settings and logs.
 
-Shared scripts, workflows, and declared design and localization helpers are maintained in `homebrew-tap/templates/macos-app`. This repository declares its repository-relative helper destinations in the `shared` object of `macos-app.json`; app configuration, translations, product behavior and targeted checks belong here. Update shared implementation in the tap and synchronize from its root with explicit app checkout arguments after reviewing local and staged changes. Do not commit host-specific paths or assume a workspace layout. See [Shared Maintenance](https://github.com/mayflies-app/homebrew-tap/tree/main/templates/macos-app#shared-maintenance).
+Shared scripts, workflows, and declared design and localization helpers are maintained in `macos-app-tooling/templates/macos-app`. This repository declares its repository-relative helper destinations in the `shared` object of `macos-app.json`; app configuration, translations, product behavior and targeted checks belong here. Update shared implementation in macos-app-tooling and synchronize from its root with explicit app checkout arguments after reviewing local and staged changes. Do not commit host-specific paths or assume a workspace layout. See [Shared Maintenance](https://github.com/mayflies-app/macos-app-tooling/tree/main/templates/macos-app#shared-maintenance).
 
 ## Validation
 
