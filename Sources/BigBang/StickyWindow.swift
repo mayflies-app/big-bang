@@ -49,6 +49,7 @@ import BigBangNetworking
     var close: (() -> Void)?
     var pin: ((Bool) -> Void)?
     var contentHeightChanged: ((CGFloat) -> Void)?
+    var outputAttached: ((StickyTextView) -> Void)?
     init(preset: Preset, source: String, capturingSelection: Bool = false) {
         self.preset = preset; self.source = source
         self.capturingSelection = capturingSelection
@@ -189,7 +190,8 @@ struct StickyView: View {
                                                onSelection: { model.preserveRestoredFollowing = false; model.autoScroll = false },
                                                close: { model.close?() }, toggleFollowing: { model.autoScroll.toggle() },
                                                following: model.autoScroll, readingPosition: model.restoredReadingPosition,
-                                               onUserScroll: { model.preserveRestoredFollowing = false })
+                                               onUserScroll: { model.preserveRestoredFollowing = false },
+                                               onWindowAttached: { model.outputAttached?($0) })
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
                         if let error = model.displayedError {
@@ -500,6 +502,8 @@ final class StickyPanel: NSPanel, TextEditorFocusWindow {
     let hostingView: NSHostingView<StickyView>
     var onClose: (() -> Void)?
     private var pendingResize: Task<Void, Never>?
+    private var outputFocusRequest: UUID?
+    private weak var outputFocusResponder: NSResponder?
     var cancelCapture: (() -> Void)?
     private(set) var captureCancelled = false
     init(preset: Preset, source: String, offset: Int, capturingSelection: Bool = false) {
@@ -531,6 +535,7 @@ final class StickyPanel: NSPanel, TextEditorFocusWindow {
         panel.delegate = self
         model.close = { [weak self] in self?.window?.close() }
         model.pin = { [weak panel] value in panel?.level = value ? .floating : .normal }
+        model.outputAttached = { [weak self] view in self?.restoreOutputFocus(in: view) }
         model.contentHeightChanged = { [weak self] height in
             guard let self else { return }
             self.pendingResize?.cancel()
@@ -586,6 +591,7 @@ final class StickyPanel: NSPanel, TextEditorFocusWindow {
         }
         model.submit = { [weak self] in
             guard let self, self.model.awaitingInput, !self.model.capturingSelection else { return }
+            self.cancelOutputFocus()
             // Leave composition with the native input method until the user commits it.
             if let editor = self.window?.firstResponder as? NSTextView, editor.hasMarkedText() { return }
             let latest = configuration()
@@ -594,23 +600,32 @@ final class StickyPanel: NSPanel, TextEditorFocusWindow {
         }
         model.retry = { [weak self] in
             guard let self, !self.model.awaitingInput, !self.model.capturingSelection else { return }
+            self.cancelOutputFocus()
             let latest = configuration()
             let preset = latest.presets.first { $0.id == self.model.preset.id } ?? self.model.preset
             restart(self, preset: preset, configuration: latest)
         }
         model.editInput = { [weak self] in
             guard let self, !self.model.awaitingInput, !self.model.capturingSelection else { return }
+            self.cancelOutputFocus()
             let readingPosition = self.outputView(in: self.hostingView)?.readingPosition(following: self.model.autoScroll)
             self.model.editResult(readingPosition: readingPosition)
             self.window?.makeKeyAndOrderFront(nil)
         }
         model.cancelEdit = { [weak self] in
-            guard let self else { return }
+            guard let self, self.model.canReturnToResult else { return }
+            self.cancelOutputFocus()
+            if let window = self.window, window.isKeyWindow {
+                self.outputFocusRequest = UUID()
+                self.outputFocusResponder = window.firstResponder
+            }
             self.model.restoreResult()
+            if self.model.output.isEmpty { self.cancelOutputFocus() }
             self.setLanguage(to: self.model.language)
         }
         model.selectPreset = { [weak self] id in
             guard let self, id != self.model.preset.id else { return }
+            self.cancelOutputFocus()
             let latest = configuration()
             guard let preset = latest.presets.first(where: { $0.id == id }) else { return }
             if self.model.awaitingInput || self.model.capturingSelection {
@@ -621,6 +636,28 @@ final class StickyPanel: NSPanel, TextEditorFocusWindow {
             }
         }
         updateConfiguration(configuration())
+    }
+    private func cancelOutputFocus() {
+        outputFocusRequest = nil
+        outputFocusResponder = nil
+    }
+    private func restoreOutputFocus(in view: StickyTextView) {
+        guard let request = outputFocusRequest else { return }
+        // Transfer once after attachment, independently of asynchronous diagram layout.
+        // Keep the window out of the queued capture; close/key changes retire the request.
+        DispatchQueue.main.async { [weak self, weak view] in
+            guard let self, self.outputFocusRequest == request, let view else { return }
+            let expectedResponder = self.outputFocusResponder
+            self.cancelOutputFocus()
+            guard !self.model.awaitingInput, let window = self.window,
+                  window.isVisible, window.isKeyWindow, view.window === window,
+                  (window as? StickyPanel)?.textEditorFocus.allowsFocus == true else { return }
+            // Removing the input editor naturally leaves the panel as responder.
+            // A newer focus choice in the same window takes precedence over this return.
+            let responder = window.firstResponder
+            guard responder == nil || responder === window || responder === expectedResponder else { return }
+            window.makeFirstResponder(view)
+        }
     }
     private func resizeForOutput(_ contentHeight: CGFloat) {
         guard let window else { return }
@@ -687,10 +724,12 @@ final class StickyPanel: NSPanel, TextEditorFocusWindow {
         beginManualInput()
     }
     func windowWillClose(_ notification: Notification) {
+        cancelOutputFocus()
         cancelSelectionCapture()
         pendingResize?.cancel(); pendingResize = nil
         outputView(in: hostingView)?.dispose()
         model.stop(); onClose?()
     }
     func windowDidResize(_ notification: Notification) { (window as? StickyPanel)?.roundWindowFrame() }
+    func windowDidResignKey(_ notification: Notification) { cancelOutputFocus() }
 }

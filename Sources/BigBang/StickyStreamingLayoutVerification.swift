@@ -322,11 +322,16 @@ import BigBangCore
         var checks: [String: Bool] = [:], observations: [String: Any] = [:]
         let longOutput = (0..<75).map { "阅读🙂 段落 \($0)：返回编辑后保留原来的阅读位置和选区。" }.joined(separator: "\n\n")
         let diagram = "```mermaid\ngraph TD\n" + (1...10).map { "N\($0)[Step \($0)] --> N\($0 + 1)" }.joined(separator: "\n") + "\n```\n\n"
-        for scenario in ["middle", "bottomPaused", "following", "closePending", "diagram"] {
+        let focusRaces = ["focusTakeover", "sameWindowFocusTakeover", "switchAwayAndBack"]
+        for scenario in ["middle", "bottomPaused", "following", "closePending", "diagram"] + focusRaces {
             let prefix = style + ".editReading." + scenario + "."
-            let originalOutput = (scenario == "diagram" ? diagram : "") + longOutput
+            let hasDiagram = scenario == "diagram" || focusRaces.contains(scenario)
+            let originalOutput = (hasDiagram ? diagram : "") + longOutput
             let note = StickyWindow(preset: Preset.defaults[0], source: "Original reading input", offset: 0)
             defer { note.window?.close() }
+            var focusOwner: NSPanel?
+            var focusEditor: NSTextView?
+            defer { focusOwner?.close(); focusEditor?.removeFromSuperview() }
             var configuration = Configuration(language: .simplifiedChinese)
             configuration.apiBaseURL = "http://127.0.0.1:1/local-edit-reading"
             var reads = 0, starts = 0
@@ -342,11 +347,11 @@ import BigBangCore
             note.showWindow(nil)
             note.window?.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
-            if scenario == "diagram" {
+            if hasDiagram {
                 checks[prefix + "initialDiagramRendered"] = await diagramReady(note)
             }
             checks[prefix + "initialRenderReady"] = await stableReading(note)
-            for cycle in 1...(["closePending", "diagram"].contains(scenario) ? 1 : 2) {
+            for cycle in 1...((["closePending", "diagram"] + focusRaces).contains(scenario) ? 1 : 2) {
                 let key = prefix + "cycle\(cycle)."
                 guard let text = findText(in: note.hostingView), let scroll = findScroll(in: note.hostingView),
                       let document = scroll.documentView else { checks[key + "nativeViewsAvailable"] = false; break }
@@ -354,7 +359,7 @@ import BigBangCore
                 // rather than selecting an offset from the temporary pre-diagram DOM.
                 let range = (text.renderedText as NSString).range(of: "阅读🙂")
                 guard range.location != NSNotFound else { checks[key + "selectionTargetExists"] = false; break }
-                if scenario == "diagram" { checks[key + "selectionIsAfterDiagramText"] = range.location > 0 }
+                if hasDiagram { checks[key + "selectionIsAfterDiagramText"] = range.location > 0 }
                 text.setSelectedRange(range)
                 _ = await waitFor { text.selectedRange() == range && !note.model.autoScroll }
                 let following = scenario == "following"
@@ -362,7 +367,7 @@ import BigBangCore
                 let maximum = max(0, document.bounds.height - scroll.contentView.bounds.height)
                 let bottomScenario = following || scenario == "bottomPaused"
                 var requestedTarget = bottomScenario ? maximum : maximum / 2
-                if scenario == "diagram", let bottom = try? await text.evaluate("document.querySelector('#markdown-root .diagram-rendered').getBoundingClientRect().bottom") as? Double {
+                if hasDiagram, let bottom = try? await text.evaluate("document.querySelector('#markdown-root .diagram-rendered').getBoundingClientRect().bottom") as? Double {
                     let local = NSPoint(x: 0, y: text.isFlipped ? bottom + 30 : Double(text.bounds.height) - bottom - 30)
                     requestedTarget = max(0, min(maximum, document.convert(local, from: text).y - 25))
                 }
@@ -385,13 +390,40 @@ import BigBangCore
                 _ = await waitFor { note.model.awaitingInput && element(in: note.hostingView, identifier: "sticky.cancel-edit") != nil }
                 checks[key + "editUsesNativeActionWithoutRequest"] = edited && note.model.awaitingInput && reads == 1 && starts == 1
                 let returned = element(in: note.hostingView, identifier: "sticky.cancel-edit").map(press) == true
+                if scenario == "sameWindowFocusTakeover", let window = note.window, let content = window.contentView {
+                    let editor = NSTextView(frame: NSRect(x: 8, y: 8, width: 80, height: 24))
+                    editor.string = "Owned sentinel"
+                    content.addSubview(editor)
+                    focusEditor = editor
+                    let accepted = window.makeFirstResponder(editor)
+                    checks[key + "sameWindowEditorTakesFocusImmediately"] = accepted && window.isKeyWindow && window.firstResponder === editor
+                } else if scenario == "focusTakeover" || scenario == "switchAwayAndBack" {
+                    // No suspension between Return and a deliberate transfer to another owned
+                    // editor. Deferred reading restoration must respect this newer focus owner.
+                    let panel = NSPanel(contentRect: NSRect(x: 160, y: 160, width: 300, height: 140),
+                        styleMask: [.titled, .nonactivatingPanel], backing: .buffered, defer: false)
+                    panel.isReleasedWhenClosed = false
+                    panel.title = "Owned focus takeover fixture"
+                    let editor = NSTextView(frame: NSRect(x: 0, y: 0, width: 300, height: 140))
+                    editor.string = "Keep focus in this owned editor"
+                    panel.contentView = editor
+                    panel.makeKeyAndOrderFront(nil)
+                    let accepted = panel.makeFirstResponder(editor)
+                    focusOwner = panel; focusEditor = editor
+                    checks[key + "otherOwnedEditorTakesFocusImmediately"] = accepted && panel.isKeyWindow && panel.firstResponder === editor
+                    if scenario == "switchAwayAndBack", let window = note.window {
+                        window.makeKeyAndOrderFront(nil)
+                        let restored = window.makeFirstResponder(window)
+                        checks[key + "originalWindowReclaimsKeyWithoutOutputFocus"] = restored && window.isKeyWindow && window.firstResponder === window
+                    }
+                }
                 if scenario == "closePending" {
                     note.window?.close()
                     await pause(400)
                     checks[key + "closingPendingReturnDoesNotReopenWindow"] = returned && note.window?.isVisible == false && reads == 1 && starts == 1
                     break
                 }
-                if scenario == "diagram" {
+                if hasDiagram {
                     checks[key + "returnedDiagramRendered"] = await diagramReady(note)
                 }
                 let stable = await stableReading(note)
@@ -400,6 +432,38 @@ import BigBangCore
                       let restoredDocument = restoredScroll.documentView else { checks[key + "restoredNativeViewsAvailable"] = false; break }
                 let afterOffset = restoredScroll.documentVisibleRect.minY
                 let afterSelection = (try? await restoredText.selectionSnapshot()) ?? ""
+                if scenario == "middle" || scenario == "diagram" {
+                    // Exercise the production selection boundary without repairing firstResponder.
+                    let productionSelection = (try? await note.selectedOutputTextSnapshot()) ?? ""
+                    checks[key + "returnedSelectionIsImmediatelyAvailableToProductionHotkeys"] =
+                        productionSelection == beforeSelection && !productionSelection.isEmpty
+                    observations[key + "focus"] = ["windowIsKey": note.window?.isKeyWindow == true,
+                        "outputIsFocused": restoredText.isOutputFocused, "productionSelection": productionSelection,
+                        "firstResponderClass": note.window?.firstResponder.map { String(describing: type(of: $0)) } ?? "nil"]
+                } else if scenario == "focusTakeover" {
+                    var rejected = false
+                    do { _ = try await note.selectedOutputTextSnapshot() } catch { rejected = true }
+                    checks[key + "readingRestorationPreservesNewerFocusOwner"] = focusOwner?.isKeyWindow == true &&
+                        focusOwner?.firstResponder === focusEditor && note.window?.isKeyWindow == false
+                    checks[key + "productionHotkeysRejectInactiveRestoredSelection"] = rejected && afterSelection == beforeSelection &&
+                        !afterSelection.isEmpty && reads == 1 && starts == 1
+                    observations[key + "focus"] = ["otherWindowIsKey": focusOwner?.isKeyWindow == true,
+                        "otherEditorOwnsResponder": focusOwner?.firstResponder === focusEditor,
+                        "noteWindowIsKey": note.window?.isKeyWindow == true, "outputIsFocused": restoredText.isOutputFocused,
+                        "productionSelectionRejected": rejected]
+                } else if scenario == "sameWindowFocusTakeover" || scenario == "switchAwayAndBack" {
+                    var rejected = false
+                    do { _ = try await note.selectedOutputTextSnapshot() } catch { rejected = true }
+                    let expectedResponder: NSResponder? = scenario == "sameWindowFocusTakeover" ? focusEditor : note.window
+                    checks[key + "newerSameWindowFocusIntentSurvivesRendering"] = note.window?.isKeyWindow == true &&
+                        note.window?.firstResponder === expectedResponder && !restoredText.isOutputFocused
+                    checks[key + "productionHotkeysRejectUnfocusedRestoredSelection"] = rejected &&
+                        afterSelection == beforeSelection && !afterSelection.isEmpty && reads == 1 && starts == 1
+                    observations[key + "focus"] = ["noteWindowIsKey": note.window?.isKeyWindow == true,
+                        "expectedResponderStillOwnsFocus": note.window?.firstResponder === expectedResponder,
+                        "firstResponderClass": note.window?.firstResponder.map { String(describing: type(of: $0)) } ?? "nil",
+                        "outputIsFocused": restoredText.isOutputFocused, "productionSelectionRejected": rejected]
+                }
                 checks[key + "returnRestoresReadingOffset"] = returned && stable && abs(afterOffset - beforeOffset) <= 2
                 checks[key + "returnRestoresLiveUnicodeSelection"] = afterSelection == beforeSelection &&
                     !afterSelection.isEmpty && restoredText.selectedRange() == range

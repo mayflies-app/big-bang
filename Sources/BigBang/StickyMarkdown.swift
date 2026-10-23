@@ -22,6 +22,7 @@ struct StickyMarkdownView: NSViewRepresentable {
     var following = true
     var readingPosition: StickyReadingPosition?
     var onUserScroll: () -> Void = {}
+    var onWindowAttached: (StickyTextView) -> Void = { _ in }
     @State private var measuredHeight: CGFloat = 1
 
     func makeNSView(context: Context) -> StickyTextView { StickyTextView() }
@@ -29,11 +30,13 @@ struct StickyMarkdownView: NSViewRepresentable {
         view.onSelection = onSelection; view.close = close; view.toggleFollowing = toggleFollowing
         view.following = following
         view.onUserScroll = onUserScroll
+        view.onWindowAttached = onWindowAttached
         view.heightChanged = { height in
             if abs(measuredHeight - height) > 0.5 { measuredHeight = height }
         }
         view.update(text: text, dark: dark, language: language)
         view.restoreReadingPosition(readingPosition)
+        if view.window != nil { onWindowAttached(view) }
     }
     func sizeThatFits(_ proposal: ProposedViewSize, nsView: StickyTextView, context: Context) -> CGSize? {
         CGSize(width: max(1, proposal.width ?? 354), height: max(measuredHeight, nsView.contentHeight))
@@ -79,6 +82,7 @@ struct StickyMarkdownView: NSViewRepresentable {
     var toggleFollowing: (() -> Void)?
     var following = true
     var onUserScroll: (() -> Void)?
+    var onWindowAttached: ((StickyTextView) -> Void)?
     var heightChanged: ((CGFloat) -> Void)?
 
     init() {
@@ -128,6 +132,10 @@ struct StickyMarkdownView: NSViewRepresentable {
         loadRenderer()
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) unavailable") }
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window != nil { onWindowAttached?(self) }
+    }
     override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: contentHeight) }
     var isOutputFocused: Bool {
         guard let responder = window?.firstResponder as? NSView else { return false }
@@ -401,7 +409,7 @@ struct StickyMarkdownView: NSViewRepresentable {
     }
     func dispose() {
         disposed = true; stopLoading()
-        pendingReadingPosition = nil; onUserScroll = nil
+        pendingReadingPosition = nil; onUserScroll = nil; onWindowAttached = nil
         if let observer = documentFrameObserver { NotificationCenter.default.removeObserver(observer) }
         documentFrameObserver = nil; observedDocument = nil
         if let wheelMonitor { NSEvent.removeMonitor(wheelMonitor) }
