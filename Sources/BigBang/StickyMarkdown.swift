@@ -3,6 +3,13 @@ import SwiftUI
 import WebKit
 import BigBangCore
 
+/// Transient presentation state for returning to the same result after editing.
+struct StickyReadingPosition {
+    let id = UUID()
+    let selection: NSRange
+    let offset: CGFloat?
+}
+
 /// One selectable document. Its vertical scrolling belongs to the native host.
 /// All Markdown, formula and diagram dependencies ship in the application.
 struct StickyMarkdownView: NSViewRepresentable {
@@ -13,16 +20,20 @@ struct StickyMarkdownView: NSViewRepresentable {
     var close: () -> Void
     var toggleFollowing: () -> Void = {}
     var following = true
+    var readingPosition: StickyReadingPosition?
+    var onUserScroll: () -> Void = {}
     @State private var measuredHeight: CGFloat = 1
 
     func makeNSView(context: Context) -> StickyTextView { StickyTextView() }
     func updateNSView(_ view: StickyTextView, context: Context) {
         view.onSelection = onSelection; view.close = close; view.toggleFollowing = toggleFollowing
         view.following = following
+        view.onUserScroll = onUserScroll
         view.heightChanged = { height in
             if abs(measuredHeight - height) > 0.5 { measuredHeight = height }
         }
         view.update(text: text, dark: dark, language: language)
+        view.restoreReadingPosition(readingPosition)
     }
     func sizeThatFits(_ proposal: ProposedViewSize, nsView: StickyTextView, context: Context) -> CGSize? {
         CGSize(width: max(1, proposal.width ?? 354), height: max(measuredHeight, nsView.contentHeight))
@@ -43,6 +54,13 @@ struct StickyMarkdownView: NSViewRepresentable {
     private var wheelMonitor: Any?
     private var clipboardMonitor: Any?
     private var cachedRange = NSRange(location: 0, length: 0)
+    private var readingPositionID: UUID?
+    private var pendingReadingPosition: StickyReadingPosition?
+    private var readingRestoreScheduled = false
+    private var readingLayoutReady = false
+    private var hostDocumentHeight: CGFloat?
+    private weak var observedDocument: NSView?
+    private var documentFrameObserver: NSObjectProtocol?
     private var pageURL: URL?
     private var plainTextFallback = false
     private(set) var resourceLocation = ""
@@ -60,6 +78,7 @@ struct StickyMarkdownView: NSViewRepresentable {
     var close: (() -> Void)?
     var toggleFollowing: (() -> Void)?
     var following = true
+    var onUserScroll: (() -> Void)?
     var heightChanged: ((CGFloat) -> Void)?
 
     init() {
@@ -94,6 +113,8 @@ struct StickyMarkdownView: NSViewRepresentable {
             // WKContentView consumes wheel events even when its document cannot
             // scroll vertically. Keep horizontal events inside tables/code, but
             // hand native vertical scrolling (including momentum) to the host.
+            self.pendingReadingPosition = nil
+            self.onUserScroll?()
             scroll.scrollWheel(with: event)
             return nil
         }
@@ -118,6 +139,7 @@ struct StickyMarkdownView: NSViewRepresentable {
         guard !initialized || source != text || self.dark != dark || self.language != language else { return }
         initialized = true
         source = text; self.dark = dark; self.language = language; revision += 1
+        readingLayoutReady = false
         // Coalesce changes in one run-loop turn. JS also rejects obsolete diagram results.
         guard !pendingRender else { return }
         pendingRender = true
@@ -149,11 +171,69 @@ struct StickyMarkdownView: NSViewRepresentable {
     }
     func evaluate(_ script: String) async throws -> Any { try await evaluateJavaScript(script) ?? NSNull() }
     func selectedRange() -> NSRange { cachedRange }
-    func setSelectedRange(_ range: NSRange) {
+    func setSelectedRange(_ range: NSRange, restoring: Bool = false) {
         guard ready, range.location != NSNotFound else { return }
-        callAsyncJavaScript("window.sticky.selectRange(location, length);",
-                            arguments: ["location": range.location, "length": range.length], in: nil, in: .page,
+        callAsyncJavaScript("window.sticky.selectRange(location, length, restoring);",
+                            arguments: ["location": range.location, "length": range.length, "restoring": restoring], in: nil, in: .page,
                             completionHandler: nil)
+    }
+    func readingPosition(following: Bool) -> StickyReadingPosition? {
+        guard renderingComplete, readingLayoutReady, let scroll = outerScrollView else { return nil }
+        return StickyReadingPosition(selection: cachedRange, offset: following ? nil : scroll.documentVisibleRect.minY)
+    }
+    func restoreReadingPosition(_ position: StickyReadingPosition?) {
+        guard readingPositionID != position?.id else { return }
+        readingPositionID = position?.id
+        pendingReadingPosition = position
+        if position == nil {
+            if let observer = documentFrameObserver { NotificationCenter.default.removeObserver(observer) }
+            documentFrameObserver = nil; observedDocument = nil
+        }
+        scheduleReadingRestoration()
+    }
+    func hostLayoutDidChange(height: CGFloat) {
+        hostDocumentHeight = height
+        scheduleReadingRestoration()
+    }
+    override func layout() {
+        super.layout()
+        scheduleReadingRestoration()
+    }
+    private func scheduleReadingRestoration() {
+        guard pendingReadingPosition != nil, !readingRestoreScheduled, !disposed else { return }
+        readingRestoreScheduled = true
+        // Renderer height and SwiftUI's native document frame settle in separate passes.
+        // Retry from their layout callbacks, never from a timer or after a new result.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.readingRestoreScheduled = false
+            guard !self.disposed, self.pendingReadingPosition != nil else { return }
+            if let document = self.outerScrollView?.documentView, self.observedDocument !== document {
+                if let observer = self.documentFrameObserver { NotificationCenter.default.removeObserver(observer) }
+                self.observedDocument = document
+                document.postsFrameChangedNotifications = true
+                self.documentFrameObserver = NotificationCenter.default.addObserver(
+                    forName: NSView.frameDidChangeNotification, object: document, queue: .main) { [weak self] _ in
+                        MainActor.assumeIsolated { self?.scheduleReadingRestoration() }
+                    }
+            }
+            guard !self.disposed, self.window?.isVisible == true, self.renderingComplete, self.readingLayoutReady,
+                  abs(self.bounds.height - self.contentHeight) <= 1,
+                  abs(self.bounds.width - self.contentWidth) <= 1,
+                  let position = self.pendingReadingPosition, let scroll = self.outerScrollView,
+                  let document = scroll.documentView, let hostHeight = self.hostDocumentHeight,
+                  hostHeight >= self.contentHeight, abs(document.bounds.height - hostHeight) <= 1 else { return }
+            self.pendingReadingPosition = nil
+            if let observer = self.documentFrameObserver { NotificationCenter.default.removeObserver(observer) }
+            self.documentFrameObserver = nil; self.observedDocument = nil
+            self.setSelectedRange(position.selection, restoring: true)
+            if let offset = position.offset {
+                let target = scroll.contentView.constrainBoundsRect(NSRect(
+                    origin: NSPoint(x: scroll.contentView.bounds.minX, y: offset), size: scroll.contentView.bounds.size))
+                scroll.contentView.scroll(to: target.origin)
+                scroll.reflectScrolledClipView(scroll.contentView)
+            }
+        }
     }
     /// Read live DOM selection for hotkeys rather than relying on delayed IPC messages.
     func selectionSnapshot() async throws -> String {
@@ -172,19 +252,24 @@ struct StickyMarkdownView: NSViewRepresentable {
         case "layout":
             guard incoming == revision, let height = body["height"] as? Double, height.isFinite, height >= 0 else { return }
             renderedRevision = incoming; renderedSource = source
+            readingLayoutReady = body["settled"] as? Bool == true
             renderedText = body["text"] as? String ?? renderedText
             contentWidth = CGFloat(body["width"] as? Double ?? Double(bounds.width))
             let next = max(1, ceil(height))
             if abs(next - contentHeight) > 0.5 {
                 contentHeight = next; invalidateIntrinsicContentSize(); heightChanged?(next)
             }
+            scheduleReadingRestoration()
         case "selection":
             guard incoming == renderedRevision || incoming == revision else { return }
             selectedText = body["text"] as? String ?? ""
             cachedRange = NSRange(location: max(0, body["location"] as? Int ?? 0), length: max(0, body["length"] as? Int ?? 0))
             // Streaming can restore the same selected fragment at a different offset
             // when Markdown closes. Only a fresh selection pauses the reader's follow choice.
-            if !selectedText.isEmpty && body["restored"] as? Bool != true { onSelection?() }
+            if !selectedText.isEmpty && body["restored"] as? Bool != true {
+                pendingReadingPosition = nil
+                onSelection?()
+            }
         case "anchor":
             guard incoming == revision, let y = body["y"] as? Double, y.isFinite else { return }
             scrollToDocumentY(CGFloat(y))
@@ -281,17 +366,22 @@ struct StickyMarkdownView: NSViewRepresentable {
             <!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'">
             <style>html,body{margin:0;background:transparent;overflow:hidden}pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font:14px/18px -apple-system}</style>
             <pre id="markdown-root">\(escaped)</pre><script>
-            const root=document.getElementById('markdown-root');let revision=0;
+            const root=document.getElementById('markdown-root');let revision=0,restoredSelection=null;
             const post=m=>window.webkit.messageHandlers.sticky.postMessage(m);
-            const layout=()=>post({type:'layout',revision,height:root.getBoundingClientRect().height+1,width:innerWidth,text:root.textContent});
+            const layout=()=>post({type:'layout',revision,settled:true,height:root.getBoundingClientRect().height+1,width:innerWidth,text:root.textContent});
             const selection=()=>{const s=getSelection();if(!s.rangeCount)return {revision,location:0,length:0,text:''};
               const r=s.getRangeAt(0);if(!root.contains(r.startContainer)||!root.contains(r.endContainer))return {revision,location:0,length:0,text:''};
               const p=document.createRange();p.selectNodeContents(root);p.setEnd(r.startContainer,r.startOffset);
               return {revision,location:p.toString().length,length:r.toString().length,text:s.toString()};};
             window.sticky={render:p=>{revision=p.revision;root.textContent=p.text;root.style.color=p.dark?'#ededed':'#222';layout();},selection,
-              selectRange:(location,length)=>{const n=root.firstChild;if(!n)return;const r=document.createRange(),s=getSelection();
-                const start=Math.min(n.length,Math.max(0,location));r.setStart(n,start);r.setEnd(n,Math.min(n.length,start+Math.max(0,length)));s.removeAllRanges();s.addRange(r);}};
-            document.addEventListener('selectionchange',()=>post({type:'selection',...selection()}));
+              selectRange:(location,length,restoring=false)=>{restoredSelection=null;const n=root.firstChild;if(!n)return;const r=document.createRange(),s=getSelection();
+                const start=Math.min(n.length,Math.max(0,location));r.setStart(n,start);r.setEnd(n,Math.min(n.length,start+Math.max(0,length)));s.removeAllRanges();s.addRange(r);
+                if(restoring)restoredSelection=selection();}};
+            document.addEventListener('selectionchange',()=>{const current=selection();
+              const restored=restoredSelection!==null&&['revision','location','length','text'].every(k=>current[k]===restoredSelection[k]);
+              if(!restored)restoredSelection=null;post({type:'selection',...current,restored});});
+            document.addEventListener('pointerdown',()=>{restoredSelection=null;});
+            document.addEventListener('keydown',()=>{restoredSelection=null;});
             document.addEventListener('contextmenu',e=>{e.preventDefault();post({type:'contextMenu',revision,x:e.clientX,y:e.clientY});});
             new ResizeObserver(layout).observe(root);post({type:'ready'});
             </script>
@@ -311,6 +401,9 @@ struct StickyMarkdownView: NSViewRepresentable {
     }
     func dispose() {
         disposed = true; stopLoading()
+        pendingReadingPosition = nil; onUserScroll = nil
+        if let observer = documentFrameObserver { NotificationCenter.default.removeObserver(observer) }
+        documentFrameObserver = nil; observedDocument = nil
         if let wheelMonitor { NSEvent.removeMonitor(wheelMonitor) }
         wheelMonitor = nil
         if let clipboardMonitor { NSEvent.removeMonitor(clipboardMonitor) }

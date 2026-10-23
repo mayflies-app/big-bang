@@ -17,6 +17,8 @@ import BigBangNetworking
     @Published var error: String?
     @Published var pinned = true
     @Published var autoScroll = true
+    @Published var preserveRestoredFollowing = false
+    @Published private(set) var restoredReadingPosition: StickyReadingPosition?
     @Published var contentOverflows = false
     @Published var language = L10n.currentLanguage
     private struct ResultSnapshot {
@@ -26,6 +28,7 @@ import BigBangNetworking
         let state: String
         let error: String?
         let autoScroll: Bool
+        let readingPosition: StickyReadingPosition?
     }
     @Published private var resultBeforeEditing: ResultSnapshot?
     var canReturnToResult: Bool { resultBeforeEditing != nil }
@@ -58,15 +61,18 @@ import BigBangNetworking
     func beginManualInput() { awaitingInput = true }
     func acceptInput(_ text: String) {
         resultBeforeEditing = nil
+        clearReadingRestoration()
         source = text
         awaitingInput = false
     }
-    func editResult() {
+    func editResult(readingPosition: StickyReadingPosition? = nil) {
         guard !awaitingInput && !capturingSelection else { return }
         // A partial result can be restored, but its cancelled request must stay stopped.
         if running { stop() } else { service.cancel() }
         resultBeforeEditing = ResultSnapshot(preset: preset, source: source, output: output,
-                                            state: state, error: error, autoScroll: autoScroll)
+                                            state: state, error: error, autoScroll: autoScroll,
+                                            readingPosition: readingPosition)
+        clearReadingRestoration()
         draft = source
         output = ""
         error = nil
@@ -82,9 +88,15 @@ import BigBangNetworking
         state = result.state
         error = result.error
         autoScroll = result.autoScroll
+        restoredReadingPosition = result.readingPosition
+        preserveRestoredFollowing = result.readingPosition != nil && !result.autoScroll
         draft = ""
         awaitingInput = false
         resultBeforeEditing = nil
+    }
+    func clearReadingRestoration() {
+        restoredReadingPosition = nil
+        preserveRestoredFollowing = false
     }
     func updatePresets(_ presets: [Preset]) {
         availablePresets = presets
@@ -92,6 +104,7 @@ import BigBangNetworking
     }
     func usePreset(_ preset: Preset) { self.preset = preset }
     func start(configuration: Configuration, key: String) {
+        clearReadingRestoration()
         // Invalidate the old stream even when validating the new request fails.
         service.cancel()
         language = configuration.language
@@ -173,8 +186,10 @@ struct StickyView: View {
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         } else if !model.output.isEmpty {
                             StickyMarkdownView(text: model.output, dark: colorScheme == .dark, language: model.language,
-                                               onSelection: { model.autoScroll = false }, close: { model.close?() },
-                                               toggleFollowing: { model.autoScroll.toggle() }, following: model.autoScroll)
+                                               onSelection: { model.preserveRestoredFollowing = false; model.autoScroll = false },
+                                               close: { model.close?() }, toggleFollowing: { model.autoScroll.toggle() },
+                                               following: model.autoScroll, readingPosition: model.restoredReadingPosition,
+                                               onUserScroll: { model.preserveRestoredFollowing = false })
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
                         if let error = model.displayedError {
@@ -193,7 +208,9 @@ struct StickyView: View {
                 // a scroller gutter or moving the text before the panel catches up.
                 .scrollIndicators(model.contentOverflows ? .automatic : .never)
                 .scrollDisabled(!model.contentOverflows)
-                .modifier(OutputFollowing(follow: $model.autoScroll, canScroll: model.contentOverflows) {
+                .modifier(OutputFollowing(follow: $model.autoScroll,
+                                          preserveRestoredFollowing: $model.preserveRestoredFollowing,
+                                          canScroll: model.contentOverflows) {
                     proxy.scrollTo("end", anchor: .bottom)
                 })
                 .contextMenu { Toggle(L10n.string("跟随输出", language: model.language), isOn: $model.autoScroll) }
@@ -378,6 +395,7 @@ private struct StickyActionStyle: ButtonStyle {
 
 private struct OutputFollowing: ViewModifier {
     @Binding var follow: Bool
+    @Binding var preserveRestoredFollowing: Bool
     let canScroll: Bool
     let scrollToEnd: () -> Void
     private struct Position: Equatable {
@@ -398,13 +416,23 @@ private struct OutputFollowing: ViewModifier {
                     if old.height != new.height || old.viewportHeight != new.viewportHeight {
                         // Growing output must not be mistaken for scrolling away from the bottom.
                         if follow { scrollToEnd() }
+                    } else if preserveRestoredFollowing {
+                        // Restoring a paused result at the bottom is not a reader scroll.
+                        return
                     } else if new.visibleBottom >= new.height - 24 {
                         follow = true
                     } else if new.offset < old.offset - 0.5 {
                         follow = false
                     }
                 }
-                .onChange(of: follow) { _, enabled in if enabled && canScroll { scrollToEnd() } }
+                .onScrollPhaseChange { _, phase in
+                    if phase == .tracking || phase == .interacting || phase == .decelerating {
+                        preserveRestoredFollowing = false
+                    }
+                }
+                .onChange(of: follow) { _, enabled in
+                    if enabled { preserveRestoredFollowing = false; if canScroll { scrollToEnd() } }
+                }
                 .onChange(of: canScroll) { _, enabled in if enabled && follow { scrollToEnd() } }
         } else {
             content
@@ -549,6 +577,7 @@ final class StickyPanel: NSPanel, TextEditorFocusWindow {
                     throw ValidationError("请先在设置中保存 API Key。")
                 }
                 sticky.model.stop()
+                sticky.model.clearReadingRestoration()
                 if let input { sticky.model.acceptInput(input) }
                 sticky.model.usePreset(preset)
                 sticky.setLanguage(to: configuration.language)
@@ -571,7 +600,8 @@ final class StickyPanel: NSPanel, TextEditorFocusWindow {
         }
         model.editInput = { [weak self] in
             guard let self, !self.model.awaitingInput, !self.model.capturingSelection else { return }
-            self.model.editResult()
+            let readingPosition = self.outputView(in: self.hostingView)?.readingPosition(following: self.model.autoScroll)
+            self.model.editResult(readingPosition: readingPosition)
             self.window?.makeKeyAndOrderFront(nil)
         }
         model.cancelEdit = { [weak self] in
@@ -608,6 +638,7 @@ final class StickyPanel: NSPanel, TextEditorFocusWindow {
         // needed for genuine overflow at the screen/window limit, never for growth.
         let overflows = contentHeight > height - StickyView.headerHeight - 1
         if model.contentOverflows != overflows { model.contentOverflows = overflows }
+        outputView(in: hostingView)?.hostLayoutDidChange(height: contentHeight)
     }
     private func focusedOutput() throws -> StickyTextView {
         guard let window, window.isKeyWindow,

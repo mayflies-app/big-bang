@@ -5,7 +5,7 @@ import {createDiagramSanitizer} from './diagram-sanitizer.mjs';
 const root = document.getElementById('markdown-root');
 const parse = createRenderer();
 const cleanDiagram = createDiagramSanitizer(window);
-let revision = 0, source = '', diagramQueue = Promise.resolve(), layoutPending = false;
+let revision = 0, source = '', diagramQueue = Promise.resolve(), layoutPending = false, settledRevision = -1;
 let restoredSelection = null;
 const blockTags = new Set(['P', 'DIV', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'PRE', 'LI', 'BLOCKQUOTE', 'TR', 'SECTION']);
 function post(message) { window.webkit?.messageHandlers?.sticky?.postMessage(message); }
@@ -40,7 +40,7 @@ function selection() {
   if (start === null || end === null) return {revision, location: 0, length: 0, text: ''};
   return {revision, location: Math.min(start, end), length: Math.abs(end - start), text: selected.toString()};
 }
-function selectRange(location, length) {
+function selectRange(location, length, restoring = false) {
   restoredSelection = null;
   const index = indexText(); const start = Math.max(0, Math.min(index.text.length, Number(location) || 0)); const end = Math.max(start, Math.min(index.text.length, start + (Number(length) || 0)));
   function point(offset, isEnd = false) {
@@ -50,7 +50,9 @@ function selectRange(location, length) {
   const a = point(start); const b = point(end, true); const range = document.createRange();
   range.setStart(a.node, a.offset); range.setEnd(b.node, b.offset);
   const selected = window.getSelection(); selected.removeAllRanges(); selected.addRange(range);
-  return selection();
+  const current = selection();
+  if (restoring) restoredSelection = current;
+  return current;
 }
 function captureSelection() {
   const current = selection(); if (!current.length) return null;
@@ -77,7 +79,7 @@ function layout() {
   if (layoutPending) return; layoutPending = true;
   requestAnimationFrame(() => {
     layoutPending = false;
-    post({type: 'layout', revision, height: Math.ceil(root.getBoundingClientRect().height) + 1, width: Math.ceil(document.documentElement.clientWidth), text: indexText().text});
+    post({type: 'layout', revision, settled: settledRevision === revision, height: Math.ceil(root.getBoundingClientRect().height) + 1, width: Math.ceil(document.documentElement.clientWidth), text: indexText().text});
   });
 }
 async function renderDiagrams(diagrams, expected, dark) {
@@ -100,15 +102,28 @@ async function renderDiagrams(diagrams, expected, dark) {
 function render(input = {}) {
   const saved = captureSelection();
   revision = Number(input.revision) || revision + 1; source = String(input.text ?? '');
+  settledRevision = -1;
   document.documentElement.dataset.theme = input.dark ? 'dark' : 'light'; document.documentElement.lang = input.language || 'zh-Hans';
   const result = parse(source); root.innerHTML = result.html; restoreSelection(saved);
-  root.querySelectorAll('img').forEach(image => {
-    image.addEventListener('load', layout, {once: true});
-    image.addEventListener('error', () => { if (!image.isConnected) return; const alt = document.createElement('span'); alt.className = 'image-fallback'; alt.textContent = image.alt || '[image]'; image.replaceWith(alt); layout(); }, {once: true});
-  });
+  const imagesReady = [...root.querySelectorAll('img')].map(image => new Promise(resolve => {
+    const finish = () => {
+      if (image.isConnected) {
+        if (!image.naturalWidth) { const alt = document.createElement('span'); alt.className = 'image-fallback'; alt.textContent = image.alt || '[image]'; image.replaceWith(alt); }
+        layout();
+      }
+      resolve();
+    };
+    if (image.complete) finish();
+    else { image.addEventListener('load', finish, {once: true}); image.addEventListener('error', finish, {once: true}); }
+  }));
   layout();
   const expected = revision; const dark = !!input.dark;
   diagramQueue = diagramQueue.catch(() => {}).then(() => renderDiagrams(result.diagrams, expected, dark));
+  // A slow image in an obsolete revision must not hold up later diagram rendering.
+  Promise.all([diagramQueue, ...imagesReady]).then(async () => {
+    await document.fonts?.ready;
+    if (expected === revision) { settledRevision = expected; layout(); }
+  });
   return {revision};
 }
 function inspect() {

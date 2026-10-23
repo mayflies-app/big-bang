@@ -181,19 +181,35 @@ import BigBangCore
                 text.renderedSource == note.model.output && text.renderingComplete &&
                     scroll.documentVisibleRect.maxY >= document.bounds.height - 25
             }
+            let revisionBeforeReturningLanguage = text.revision
             configuration.language = .simplifiedChinese
             note.updateConfiguration(configuration)
+            checks[name + ".nativeScrollStartsAfterLanguageRender"] = await waitFor {
+                text.revision > revisionBeforeReturningLanguage && text.renderingComplete && text.renderedSource == note.model.output
+            }
+            checks[name + ".nativeScrollStartsAfterStableGeometry"] = await stableReading(note)
 
             // Keep the independent native-scroll route covered after testing the button.
             let resumedBottom = scroll.documentVisibleRect.minY
+            let nativeScrollBefore: [String: Any] = ["offset": resumedBottom, "documentHeight": document.bounds.height,
+                "viewportHeight": scroll.contentView.bounds.height, "clipBounds": NSStringFromRect(scroll.contentView.bounds),
+                "revision": text.revision, "renderedRevision": text.renderedRevision,
+                "renderComplete": text.renderingComplete, "following": note.model.autoScroll]
             scroll.contentView.scroll(to: NSPoint(x: 0, y: max(0, resumedBottom - 180)))
             scroll.reflectScrolledClipView(scroll.contentView)
             await pause(120)
             if #available(macOS 15.0, *) {
-                checks[name + ".readingOlderTextPausesAgainAfterJump"] = !note.model.autoScroll
+                checks[name + ".readingOlderTextPausesAgainAfterJump"] = await waitFor {
+                    scroll.documentVisibleRect.minY < resumedBottom - 100 && !note.model.autoScroll
+                }
             } else {
                 note.model.autoScroll = false
             }
+            histories[name + ".nativeScrollAfterLanguage"] = ["before": nativeScrollBefore,
+                "after": ["offset": scroll.documentVisibleRect.minY, "documentHeight": document.bounds.height,
+                    "viewportHeight": scroll.contentView.bounds.height, "clipBounds": NSStringFromRect(scroll.contentView.bounds),
+                    "revision": text.revision, "renderedRevision": text.renderedRevision,
+                    "renderComplete": text.renderingComplete, "following": note.model.autoScroll]]
             scroll.contentView.scroll(to: NSPoint(x: 0, y: max(0, document.bounds.height - scroll.contentView.bounds.height)))
             scroll.reflectScrolledClipView(scroll.contentView)
             await pause(120)
@@ -284,10 +300,13 @@ import BigBangCore
             recorder.stop()
             histories[name] = recorder.samples.map(\.json)
             note.window?.close()
+            let editReading = await verifyEditReading(style: name, reportURL: reportURL)
+            checks.merge(editReading.checks) { _, new in new }
+            histories[name + ".editReading"] = editReading.observations
         }
         let report: [String: Any] = ["passed": !checks.isEmpty && checks.values.allSatisfy { $0 },
                                     "checks": checks, "observations": histories,
-                                    "scope": "Packaged native NSPanel and NSScrollView; local incremental output and process-only scrollbar preferences; no model service, keychain or persisted preferences."]
+                                    "scope": "Packaged native NSPanel, NSScrollView and live Markdown DOM; local incremental output, accessibility edit/return/submit/retry actions and process-only scrollbar preferences. Reading restoration uses fresh renderer lookup, native offset and live Unicode selection. Request/key counters use injected local closures; no model service, keychain or persisted preferences."]
         do {
             try FileManager.default.createDirectory(at: reportURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]).write(to: reportURL, options: .atomic)
@@ -297,6 +316,192 @@ import BigBangCore
 
     private static func pause(_ milliseconds: Int) async {
         try? await Task.sleep(for: .milliseconds(milliseconds))
+    }
+    private static func verifyEditReading(style: String, reportURL: URL) async ->
+        (checks: [String: Bool], observations: [String: Any]) {
+        var checks: [String: Bool] = [:], observations: [String: Any] = [:]
+        let longOutput = (0..<75).map { "阅读🙂 段落 \($0)：返回编辑后保留原来的阅读位置和选区。" }.joined(separator: "\n\n")
+        let diagram = "```mermaid\ngraph TD\n" + (1...10).map { "N\($0)[Step \($0)] --> N\($0 + 1)" }.joined(separator: "\n") + "\n```\n\n"
+        for scenario in ["middle", "bottomPaused", "following", "closePending", "diagram"] {
+            let prefix = style + ".editReading." + scenario + "."
+            let originalOutput = (scenario == "diagram" ? diagram : "") + longOutput
+            let note = StickyWindow(preset: Preset.defaults[0], source: "Original reading input", offset: 0)
+            defer { note.window?.close() }
+            var configuration = Configuration(language: .simplifiedChinese)
+            configuration.apiBaseURL = "http://127.0.0.1:1/local-edit-reading"
+            var reads = 0, starts = 0
+            note.configureProcessing(configuration: { configuration }, readKey: { reads += 1; return "" }, start: { sticky, _, _ in
+                starts += 1
+                sticky.model.output = starts == 1 ? originalOutput : "New result🙂"
+                sticky.model.autoScroll = true
+                sticky.model.running = false
+                sticky.model.state = "已完成"
+                sticky.model.error = nil
+            })
+            note.model.retry?()
+            note.showWindow(nil)
+            note.window?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            if scenario == "diagram" {
+                checks[prefix + "initialDiagramRendered"] = await diagramReady(note)
+            }
+            checks[prefix + "initialRenderReady"] = await stableReading(note)
+            for cycle in 1...(["closePending", "diagram"].contains(scenario) ? 1 : 2) {
+                let key = prefix + "cycle\(cycle)."
+                guard let text = findText(in: note.hostingView), let scroll = findScroll(in: note.hostingView),
+                      let document = scroll.documentView else { checks[key + "nativeViewsAvailable"] = false; break }
+                // The chart changes the final DOM text. Locate the target after its labels,
+                // rather than selecting an offset from the temporary pre-diagram DOM.
+                let range = (text.renderedText as NSString).range(of: "阅读🙂")
+                guard range.location != NSNotFound else { checks[key + "selectionTargetExists"] = false; break }
+                if scenario == "diagram" { checks[key + "selectionIsAfterDiagramText"] = range.location > 0 }
+                text.setSelectedRange(range)
+                _ = await waitFor { text.selectedRange() == range && !note.model.autoScroll }
+                let following = scenario == "following"
+                note.model.autoScroll = following
+                let maximum = max(0, document.bounds.height - scroll.contentView.bounds.height)
+                let bottomScenario = following || scenario == "bottomPaused"
+                var requestedTarget = bottomScenario ? maximum : maximum / 2
+                if scenario == "diagram", let bottom = try? await text.evaluate("document.querySelector('#markdown-root .diagram-rendered').getBoundingClientRect().bottom") as? Double {
+                    let local = NSPoint(x: 0, y: text.isFlipped ? bottom + 30 : Double(text.bounds.height) - bottom - 30)
+                    requestedTarget = max(0, min(maximum, document.convert(local, from: text).y - 25))
+                }
+                let target = scroll.contentView.constrainBoundsRect(NSRect(
+                    origin: NSPoint(x: 0, y: requestedTarget), size: scroll.contentView.bounds.size)).minY
+                scroll.contentView.scroll(to: NSPoint(x: 0, y: target))
+                scroll.reflectScrolledClipView(scroll.contentView)
+                await pause(160)
+                // A reader can deliberately pause while positioned at the bottom. Preserve
+                // that mode rather than inferring following solely from restored geometry.
+                if scenario == "bottomPaused" { note.model.autoScroll = false; await pause(80) }
+                let beforeOffset = scroll.documentVisibleRect.minY
+                let beforeClipBounds = NSStringFromRect(scroll.contentView.bounds)
+                let beforeDocumentHeight = document.bounds.height, beforeViewportHeight = scroll.contentView.bounds.height
+                let beforeSelection = (try? await text.selectionSnapshot()) ?? ""
+                checks[key + "startsWithUnicodeSelectionAndRequestedPosition"] = beforeSelection == "阅读🙂" &&
+                    text.selectedRange() == range && note.model.autoScroll == following &&
+                    (bottomScenario ? scroll.documentVisibleRect.maxY >= document.bounds.height - 25 : abs(beforeOffset - target) <= 2)
+                let edited = element(in: note.hostingView, identifier: "sticky.arrow.uturn.backward").map(press) == true
+                _ = await waitFor { note.model.awaitingInput && element(in: note.hostingView, identifier: "sticky.cancel-edit") != nil }
+                checks[key + "editUsesNativeActionWithoutRequest"] = edited && note.model.awaitingInput && reads == 1 && starts == 1
+                let returned = element(in: note.hostingView, identifier: "sticky.cancel-edit").map(press) == true
+                if scenario == "closePending" {
+                    note.window?.close()
+                    await pause(400)
+                    checks[key + "closingPendingReturnDoesNotReopenWindow"] = returned && note.window?.isVisible == false && reads == 1 && starts == 1
+                    break
+                }
+                if scenario == "diagram" {
+                    checks[key + "returnedDiagramRendered"] = await diagramReady(note)
+                }
+                let stable = await stableReading(note)
+                // Editing replaces the conditional Markdown subtree. Never inspect the old WK view.
+                guard let restoredText = findText(in: note.hostingView), let restoredScroll = findScroll(in: note.hostingView),
+                      let restoredDocument = restoredScroll.documentView else { checks[key + "restoredNativeViewsAvailable"] = false; break }
+                let afterOffset = restoredScroll.documentVisibleRect.minY
+                let afterSelection = (try? await restoredText.selectionSnapshot()) ?? ""
+                checks[key + "returnRestoresReadingOffset"] = returned && stable && abs(afterOffset - beforeOffset) <= 2
+                checks[key + "returnRestoresLiveUnicodeSelection"] = afterSelection == beforeSelection &&
+                    !afterSelection.isEmpty && restoredText.selectedRange() == range
+                checks[key + "returnPreservesFollowingMode"] = note.model.autoScroll == following &&
+                    (!following || restoredScroll.documentVisibleRect.maxY >= restoredDocument.bounds.height - 25)
+                checks[key + "returnPreservesResultWithoutRequest"] = note.model.source == "Original reading input" &&
+                    note.model.output == originalOutput && reads == 1 && starts == 1
+                observations[key] = ["beforeOffset": beforeOffset, "afterOffset": afterOffset,
+                    "beforeSelection": beforeSelection, "afterSelection": afterSelection,
+                    "beforeRange": NSStringFromRange(range), "afterRange": NSStringFromRange(restoredText.selectedRange()),
+                    "followingBefore": following, "followingAfter": note.model.autoScroll,
+                    "rendererWasReplaced": restoredText !== text, "renderStable": stable,
+                    "requestedTarget": requestedTarget, "constrainedTarget": target,
+                    "documentHeightBefore": beforeDocumentHeight, "viewportHeightBefore": beforeViewportHeight,
+                    "clipBoundsBefore": beforeClipBounds,
+                    "documentHeightAfter": restoredDocument.bounds.height, "viewportHeightAfter": restoredScroll.contentView.bounds.height,
+                    "clipBoundsAfter": NSStringFromRect(restoredScroll.contentView.bounds)]
+                checks[key + "screenshotSaved"] = note.window.map { snapshot($0, reportURL: reportURL,
+                    name: style + "-edit-reading-" + scenario + "-\(cycle).png") } == true
+                if scenario == "following" && cycle == 2, let window = note.window {
+                    let point = restoredText.convert(NSPoint(x: restoredText.visibleRect.midX, y: restoredText.visibleRect.midY), to: nil)
+                    let beforeWheel = restoredScroll.documentVisibleRect.minY
+                    let up = wheelEvent(window: window, point: point, vertical: 100)
+                    if let up { NSApp.sendEvent(up) }
+                    let moved = await waitFor { restoredScroll.documentVisibleRect.minY < beforeWheel - 10 }
+                    checks[prefix + "restoredRendererRoutesVerticalWheel"] = up != nil && moved
+                    if #available(macOS 15.0, *) {
+                        checks[prefix + "wheelReadingPausesFollowing"] = await waitFor { !note.model.autoScroll }
+                    }
+                    let wheelOffset = restoredScroll.documentVisibleRect.minY
+                    let down = wheelEvent(window: window, point: point, vertical: -10_000)
+                    if let down { NSApp.sendEvent(down) }
+                    checks[prefix + "wheelCanReturnToBottom"] = await waitFor {
+                        restoredScroll.documentVisibleRect.maxY >= restoredDocument.bounds.height - 25
+                    }
+                    if #available(macOS 15.0, *) {
+                        checks[prefix + "wheelBottomResumesFollowing"] = await waitFor { note.model.autoScroll }
+                    }
+                    restoredText.setSelectedRange(NSRange(location: 1, length: 3))
+                    checks[prefix + "newSelectionStillPausesFollowing"] = await waitFor {
+                        restoredText.selectedRange() == NSRange(location: 1, length: 3) && !note.model.autoScroll
+                    }
+                    checks[prefix + "wheelAndSelectionDoNotRequest"] = reads == 1 && starts == 1
+                    observations[prefix + "wheel"] = ["beforeOffset": beforeWheel, "readingOffset": wheelOffset,
+                        "afterBottomOffset": restoredScroll.documentVisibleRect.minY,
+                        "boundary": "Owned NSEvent fixture with CG wheel payload -> NSApp.sendEvent -> native local monitor -> NSScrollView",
+                        "noRequest": reads == 1 && starts == 1]
+                }
+            }
+            if scenario == "middle" {
+                _ = element(in: note.hostingView, identifier: "sticky.arrow.uturn.backward").map(press)
+                _ = await waitFor { note.model.awaitingInput && element(in: note.hostingView, identifier: "sticky.submit") != nil }
+                note.model.draft = "Replacement reading input"
+                let submitted = element(in: note.hostingView, identifier: "sticky.submit").map(press) == true
+                let rendered = await stableReading(note)
+                checks[prefix + "newSubmissionDoesNotReuseOldReadingPosition"] = submitted && rendered && starts == 2 && reads == 2 &&
+                    note.model.source == "Replacement reading input" && note.model.autoScroll &&
+                    abs(findScroll(in: note.hostingView)?.documentVisibleRect.minY ?? -100) <= 2 &&
+                    findText(in: note.hostingView)?.selectedRange().length == 0
+                note.model.output = longOutput
+                _ = await stableReading(note)
+                if let text = findText(in: note.hostingView), let scroll = findScroll(in: note.hostingView) {
+                    let range = NSRange(location: 0, length: 4)
+                    text.setSelectedRange(range)
+                    _ = await waitFor { text.selectedRange() == range && !note.model.autoScroll }
+                    scroll.contentView.scroll(to: NSPoint(x: 0, y: 180))
+                    scroll.reflectScrolledClipView(scroll.contentView)
+                }
+                let retried = element(in: note.hostingView, identifier: "sticky.arrow.clockwise").map(press) == true
+                let retryReady = await stableReading(note)
+                checks[prefix + "retryDoesNotReuseOldReadingPosition"] = retried && retryReady && starts == 3 && reads == 3 &&
+                    note.model.autoScroll && abs(findScroll(in: note.hostingView)?.documentVisibleRect.minY ?? -100) <= 2 &&
+                    findText(in: note.hostingView)?.selectedRange().length == 0
+            }
+        }
+        return (checks, observations)
+    }
+    private static func diagramReady(_ note: StickyWindow) async -> Bool {
+        for _ in 0..<250 {
+            if let text = findText(in: note.hostingView), text.ready,
+               (try? await text.evaluate("""
+                   (() => { const svg = document.querySelector('#markdown-root .diagram-rendered svg');
+                   return document.fonts.status === 'loaded' && !!svg &&
+                   svg.getBoundingClientRect().width > 0 && svg.getBoundingClientRect().height > 0; })()
+                   """)) as? Bool == true { return true }
+            await pause(20)
+        }
+        return false
+    }
+    /// Resolve the current renderer on each poll and wait for both rendering and native geometry.
+    private static func stableReading(_ note: StickyWindow) async -> Bool {
+        var previous: [CGFloat] = [], stable = 0
+        return await waitFor {
+            guard !note.model.awaitingInput, let text = findText(in: note.hostingView),
+                  let scroll = findScroll(in: note.hostingView), let document = scroll.documentView,
+                  text.ready && text.renderingComplete && text.renderedSource == note.model.output else { return false }
+            let geometry = [scroll.documentVisibleRect.minY, scroll.contentView.bounds.height, document.bounds.height,
+                            note.window?.frame.height ?? 0]
+            stable = geometry == previous ? stable + 1 : 0
+            previous = geometry
+            return stable >= 5
+        }
     }
     private static func waitFor(_ condition: () -> Bool) async -> Bool {
         for _ in 0..<100 {
@@ -329,6 +534,39 @@ import BigBangCore
         guard object.responds(to: selector) else { return false }
         typealias Action = @convention(c) (AnyObject, Selector) -> ObjCBool
         return unsafeBitCast(object.method(for: selector), to: Action.self)(object, selector).boolValue
+    }
+    // Same owned-window wheel boundary as StickyMarkdownVerification; never posts system events.
+    private static func wheelEvent(window: NSWindow, point: NSPoint, vertical: Int32) -> NSEvent? {
+        guard let source = CGEventSource(stateID: .privateState),
+              let payload = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2,
+                                    wheel1: vertical, wheel2: 0, wheel3: 0),
+              let base = NSEvent(cgEvent: payload) else { return nil }
+        let fixture = ReadingWheelEvent()
+        fixture.base = base; fixture.targetWindow = window
+        fixture.targetWindowNumber = window.windowNumber; fixture.targetPoint = point
+        return fixture
+    }
+    private final class ReadingWheelEvent: NSEvent {
+        var base: NSEvent?
+        weak var targetWindow: NSWindow?
+        var targetWindowNumber = 0
+        var targetPoint = NSPoint.zero
+        override var type: NSEvent.EventType { base?.type ?? .scrollWheel }
+        override var window: NSWindow? { targetWindow }
+        override var windowNumber: Int { targetWindowNumber }
+        override var locationInWindow: NSPoint { targetPoint }
+        override var scrollingDeltaX: CGFloat { base?.scrollingDeltaX ?? 0 }
+        override var scrollingDeltaY: CGFloat { base?.scrollingDeltaY ?? 0 }
+        override var deltaX: CGFloat { base?.deltaX ?? 0 }
+        override var deltaY: CGFloat { base?.deltaY ?? 0 }
+        override var deltaZ: CGFloat { base?.deltaZ ?? 0 }
+        override var hasPreciseScrollingDeltas: Bool { base?.hasPreciseScrollingDeltas ?? false }
+        override var isDirectionInvertedFromDevice: Bool { base?.isDirectionInvertedFromDevice ?? false }
+        override var phase: NSEvent.Phase { base?.phase ?? [] }
+        override var momentumPhase: NSEvent.Phase { base?.momentumPhase ?? [] }
+        override var modifierFlags: NSEvent.ModifierFlags { base?.modifierFlags ?? [] }
+        override var timestamp: TimeInterval { base?.timestamp ?? 0 }
+        override var cgEvent: CGEvent? { base?.cgEvent }
     }
     private static func click(_ object: NSObject, in window: NSWindow) -> Bool {
         let frame = accessibilityFrame(object)
