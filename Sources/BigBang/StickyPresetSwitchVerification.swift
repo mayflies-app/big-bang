@@ -54,6 +54,9 @@ import BigBangSelection
             local["switchUsesNativePopupAction"] = select(b.id, in: button)
             local["switchClearsPreviousOutput"] = note.model.output.isEmpty && note.model.preset.id == b.id
             local["newPresetCompletes"] = await waitFor { !note.model.running && note.model.output == "B first\nB complete" }
+            local["completedResultHasNoStoppedIndicator"] = await waitFor {
+                element(in: note.window, identifier: "sticky.stopped-state") == nil
+            }
             // A sends a deliberately delayed tail after B has completed.
             try? await Task.sleep(for: .milliseconds(1050))
             local["cancelledSessionCannotPolluteNewOutput"] = note.model.output == "B first\nB complete" && note.model.error == nil
@@ -158,8 +161,24 @@ import BigBangSelection
             note.window?.appearance = NSAppearance(named: .darkAqua)
             try? await Task.sleep(for: .milliseconds(100))
             local["runningDarkScreenshotSaved"] = note.model.running && snapshot(note.window, url: reportURL.deletingLastPathComponent().appendingPathComponent("preset-switch-\(mode.rawValue)-running-dark.png"))
+            local["runningResultHasNoStoppedIndicator"] = element(in: note.window, identifier: "sticky.stopped-state") == nil
+            let sourceBeforeStop = note.model.source
+            let outputBeforeStop = note.model.output
             local["nativeStopControlWorks"] = await press(in: note.window, identifier: "sticky.stop.fill") && !note.model.running
             let stopped = note.model.output
+            local["stoppingPreservesBodyAndOriginalInput"] = stopped == outputBeforeStop && !stopped.isEmpty &&
+                note.model.source == sourceBeforeStop && sourceBeforeStop == "preset-switch-input"
+            for language in AppLanguage.allCases {
+                note.setLanguage(to: language)
+                local["stoppedIndicatorLocalized." + language.rawValue] = await waitFor {
+                    guard let indicator = element(in: note.window, identifier: "sticky.stopped-state") else { return false }
+                    return staticTextContent(indicator) == L10n.string("已停止", language: language) &&
+                        note.window?.frame.contains(frame(indicator)) == true && !note.model.running &&
+                        note.model.output == stopped && note.model.source == sourceBeforeStop
+                }
+                diagnostics[mode.rawValue + ".stoppedIndicator." + language.rawValue] =
+                    element(in: note.window, identifier: "sticky.stopped-state").map(staticTextDiagnostics) ?? [:]
+            }
             try? await Task.sleep(for: .milliseconds(950))
             local["stopPreventsLateUpdates"] = note.model.output == stopped && note.model.state == "已停止"
             local["nativeRetryAfterStopWorks"] = await press(in: note.window, identifier: "sticky.arrow.clockwise")
@@ -167,8 +186,10 @@ import BigBangSelection
             // can arrive before SwiftUI replaces the previous retry control.
             local["closeStartsWithLiveStream"] = await waitFor {
                 note.model.output == "A first" && note.model.running &&
-                    element(in: note.window, identifier: "sticky.stop.fill") != nil
+                    element(in: note.window, identifier: "sticky.stop.fill") != nil &&
+                    element(in: note.window, identifier: "sticky.stopped-state") == nil
             }
+            local["retryHidesStoppedIndicator"] = local["closeStartsWithLiveStream"] == true
             diagnostics[mode.rawValue + ".closeBefore"] = [
                 "running": note.model.running, "visible": note.window?.isVisible == true,
                 "hasStopControl": element(in: note.window, identifier: "sticky.stop.fill") != nil
@@ -1209,6 +1230,13 @@ extension StickyPresetSwitchVerification {
                 checks[prefix + "cancelRestoresStoppedPartialOutput"] = cancelled && !note.model.awaitingInput &&
                     !note.model.running && note.model.output == partial && partial == "A first" &&
                     note.model.state == "已停止" && note.model.preset == original && note.model.source == "preset-switch-input"
+                checks[prefix + "restoredPartialResultShowsStoppedIndicator"] = await waitFor {
+                    guard let indicator = element(in: note.window, identifier: "sticky.stopped-state") else { return false }
+                    return cancelled && staticTextContent(indicator) == L10n.string("已停止", language: note.model.language) &&
+                        note.window?.frame.contains(frame(indicator)) == true && note.model.output == partial
+                }
+                diagnostics[prefix + "stoppedIndicatorAccessibility"] =
+                    element(in: note.window, identifier: "sticky.stopped-state").map(staticTextDiagnostics) ?? [:]
                 try? await Task.sleep(for: .milliseconds(1400))
                 checks[prefix + "lateStreamCannotMutateRestoredResult"] = cancelled && note.model.output == partial &&
                     note.model.state == "已停止" && !note.model.running && note.model.error == nil && starts == 1 && reads == 1
@@ -1222,6 +1250,23 @@ extension StickyPresetSwitchVerification {
         let selector = NSSelectorFromString("accessibilityLabel")
         guard object.responds(to: selector) else { return nil }
         return object.perform(selector)?.takeUnretainedValue() as? String
+    }
+
+    /// Keep button-label checks strict; only static text permits the native AXValue representation.
+    private static func staticTextContent(_ object: NSObject) -> String? {
+        let label = accessibilityLabel(object)
+        return label?.isEmpty == false ? label : accessibilityString(object, attribute: "accessibilityValue")
+    }
+    private static func accessibilityString(_ object: NSObject, attribute: String) -> String? {
+        let selector = NSSelectorFromString(attribute)
+        guard object.responds(to: selector) else { return nil }
+        let value = object.perform(selector)?.takeUnretainedValue()
+        return (value as? String) ?? (value as? NSAttributedString)?.string
+    }
+    private static func staticTextDiagnostics(_ object: NSObject) -> [String: String] {
+        ["role": accessibilityString(object, attribute: "accessibilityRole") ?? "nil",
+         "label": accessibilityString(object, attribute: "accessibilityLabel") ?? "nil",
+         "value": accessibilityString(object, attribute: "accessibilityValue") ?? "nil"]
     }
 
     /// Copy feedback is a view boundary: deterministic published stream deltas avoid the

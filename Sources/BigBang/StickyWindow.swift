@@ -127,6 +127,13 @@ struct StickyView: View {
                 if model.running {
                     ProgressView().controlSize(.mini).frame(width: 14, height: 14).padding(.leading, 5)
                         .accessibilityLabel(model.displayedState)
+                } else if !model.awaitingInput && !model.capturingSelection &&
+                            !model.output.isEmpty && model.error == nil && model.state == "已停止" {
+                    Text(model.displayedState)
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                        .lineLimit(1).fixedSize().padding(.leading, 5)
+                        .accessibilityLabel(model.displayedState)
+                        .accessibilityIdentifier("sticky.stopped-state")
                 }
                 Spacer(minLength: 4)
                 icon(copied ? "checkmark" : "doc.on.doc", help: copied ? "已复制" : "复制") {

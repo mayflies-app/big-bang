@@ -48,7 +48,7 @@ Select a different preset in a note's title to replace its result using the same
 
 Click **Back to Edit** beside Retry to return the note's latest submitted input to the text editor. This cancels any running request and keeps the current preset. Choose **Back to Result** to discard draft changes and restore the previous result and preset without another request; a cancelled request stays stopped. Or edit the text, then click **Submit** or press **⌘Enter** to replace the result in the same note. Subsequent retries use the edited input.
 
-Notes grow with streaming text, then scroll when they reach the available height. Scrolling away from the bottom or selecting text pauses following. Click **Jump to Latest** to return to the bottom and resume following; the context menu also controls Follow Output. Copy Result copies the original Markdown. Closing a note cancels its request and discards its contents. Up to eight notes can stay open.
+Notes grow with streaming text, then scroll when they reach the available height. Scrolling away from the bottom or selecting text pauses following. Click **Jump to Latest** to return to the bottom and resume following; the context menu also controls Follow Output. Stopping a request keeps its partial result and shows **Stopped** in the header; retrying clears the notice. Copy Result copies the original Markdown. Closing a note cancels its request and discards its contents. Up to eight notes can stay open.
 
 ### Model service
 

@@ -103,6 +103,65 @@ import BigBangCore
         observations["english"] = english.details
         checks["languageChangeRefreshesNameAndNaturalWidth"] = button.selectedItem?.title == "🌐 Translate" && english.compact && english.completeTitle &&
             english.width > first.width + 8 && english.blankIsNotControl
+        for language in AppLanguage.allCases {
+            configuration.language = language
+            configuration.presets[0] = Preset.defaults(for: language)[0]
+            note.updateConfiguration(configuration)
+            for (name, preset) in [("short", configuration.presets[0]), ("huge", huge)] {
+                let prefix = "stopped." + language.rawValue + "." + name + "."
+                checks[prefix + "nativeSelection"] = select(preset.id, button: button)
+                note.model.error = nil
+                note.model.stop()
+                await settle(note)
+                // Wait for the new status subtree as well as the existing retry controls.
+                for _ in 0..<100 {
+                    if let indicator = accessible(in: window, identifier: "sticky.stopped-state"),
+                       staticTextContent(indicator) == L10n.string("已停止", language: language),
+                       accessibilityFrame(indicator).width > 0 { break }
+                    try? await Task.sleep(for: .milliseconds(10))
+                }
+                let stopped = observe(note, button: button)
+                observations[prefix + "header"] = stopped.details
+                checks[prefix + "preservesPanelWidthActionsAndBody"] = abs(window.frame.width - 390) <= 1 &&
+                    stopped.actionsFit && stopped.bodyFits
+                let indicator = accessible(in: window, identifier: "sticky.stopped-state")
+                let indicatorFrame = indicator.map(accessibilityFrame) ?? .zero
+                let popupFrame = window.convertToScreen(button.convert(button.bounds, to: nil))
+                let copyFrame = accessible(in: window, identifier: "sticky.copy").map(accessibilityFrame) ?? .zero
+                let text = indicator.flatMap(staticTextContent)
+                let measuredWidth = (L10n.string("已停止", language: language) as NSString)
+                    .size(withAttributes: [.font: NSFont.systemFont(ofSize: 11)]).width
+                checks[prefix + "statusIsCompleteSingleLine"] = text == L10n.string("已停止", language: language) &&
+                    indicatorFrame.width >= measuredWidth - 1 && indicatorFrame.height >= 11 && indicatorFrame.height <= 20
+                checks[prefix + "titleStatusAndCopyDoNotOverlap"] = indicator != nil &&
+                    window.frame.contains(indicatorFrame) && popupFrame.maxX <= indicatorFrame.minX + 1 &&
+                    indicatorFrame.maxX <= copyFrame.minX + 1 && !popupFrame.intersects(copyFrame)
+                checks[prefix + "titleRemainsReadable"] = name == "short" ? stopped.completeTitle : stopped.truncates
+                observations[prefix + "status"] = ["frame": rect(indicatorFrame), "popupFrame": rect(popupFrame),
+                    "copyFrame": rect(copyFrame), "text": text ?? "nil", "expectedTextWidth": measuredWidth,
+                    "accessibility": indicator.map(staticTextDiagnostics) ?? [:]]
+                checks[prefix + "screenshotSaved"] = snapshot(window, reportURL: reportURL,
+                    name: "preset-layout-stopped-\(language.rawValue)-\(name).png")
+            }
+        }
+        // Each excluded state gets its own note so no state transition is invented for layout testing.
+        for scenario in ["running", "empty", "error", "input", "capture", "completed"] {
+            let excluded = StickyWindow(preset: short, source: scenario == "input" ? "" : "Local layout fixture",
+                                        offset: 0, capturingSelection: scenario == "capture")
+            excluded.model.output = scenario == "empty" ? "" : "Partial fixture output"
+            excluded.model.state = scenario == "completed" ? "已完成" : "已停止"
+            excluded.model.running = scenario == "running"
+            excluded.model.error = scenario == "error" ? "Fixture error" : nil
+            excluded.showWindow(nil)
+            try? await Task.sleep(for: .milliseconds(100))
+            excluded.hostingView.layoutSubtreeIfNeeded()
+            checks["stopped.excluded." + scenario] = excluded.window.map {
+                accessible(in: $0, identifier: "sticky.stopped-state") == nil
+            } == true
+            excluded.window?.close()
+        }
+        note.model.state = "演示已完成"
+        await settle(note)
         checks["sameWindowAndOriginalInput"] = note.window === originalWindow && note.model.source == "Local layout fixture"
         var report: [String: Any] = checks
         report["passed"] = checks.values.allSatisfy { $0 }
@@ -242,6 +301,22 @@ import BigBangCore
         guard object.responds(to: selector) else { return .zero }
         typealias Frame = @convention(c) (AnyObject, Selector) -> NSRect
         return unsafeBitCast(object.method(for: selector), to: Frame.self)(object, selector)
+    }
+    private static func accessibilityString(_ object: NSObject, attribute: String) -> String? {
+        let selector = NSSelectorFromString(attribute)
+        guard object.responds(to: selector) else { return nil }
+        let value = object.perform(selector)?.takeUnretainedValue()
+        return (value as? String) ?? (value as? NSAttributedString)?.string
+    }
+    /// Native static text exposes its text through AXValue on some macOS/SwiftUI versions.
+    private static func staticTextContent(_ object: NSObject) -> String? {
+        let label = accessibilityString(object, attribute: "accessibilityLabel")
+        return label?.isEmpty == false ? label : accessibilityString(object, attribute: "accessibilityValue")
+    }
+    private static func staticTextDiagnostics(_ object: NSObject) -> [String: String] {
+        ["role": accessibilityString(object, attribute: "accessibilityRole") ?? "nil",
+         "label": accessibilityString(object, attribute: "accessibilityLabel") ?? "nil",
+         "value": accessibilityString(object, attribute: "accessibilityValue") ?? "nil"]
     }
     private static func rect(_ value: NSRect) -> [String: CGFloat] {
         ["x": value.minX, "y": value.minY, "width": value.width, "height": value.height]
