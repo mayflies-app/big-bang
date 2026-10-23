@@ -1,7 +1,39 @@
 import AppKit
 
-/// Separate, ordinary AppKit process used only by the native selection smoke.
-/// It neither invokes Big Bang nor reads credentials, the clipboard, or network.
+/// Separate AppKit process used only by native selection checks. The default is
+/// the original ordinary window; explicit modes exercise nonactivating focus and
+/// native copy fallback without reading credentials, pasteboard contents or network.
+@MainActor private final class ExternalSelectionPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+}
+
+/// Hide only the AX selection surface in copy-only mode. NSTextView still owns
+/// the real selection and its standard copy implementation.
+@MainActor private final class ExternalSelectionTextView: NSTextView {
+    var copyOnly = false
+
+    override func accessibilitySelectedText() -> String? {
+        copyOnly ? nil : super.accessibilitySelectedText()
+    }
+
+    override func accessibilitySelectedTextRange() -> NSRange {
+        copyOnly ? NSRange(location: NSNotFound, length: 0) : super.accessibilitySelectedTextRange()
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        // A nonactivating panel can own input while another app owns the menu
+        // bar. Dispatch this real local shortcut through NSTextView's copy path.
+        if window?.isKeyWindow == true, window?.firstResponder === self, event.type == .keyDown,
+           event.modifierFlags.intersection([.command, .control, .option, .shift]) == .command,
+           event.charactersIgnoringModifiers?.lowercased() == "c" {
+            super.copy(nil)
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+}
+
 @MainActor final class ExternalSelectionFixtureDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow?
     private var textView: NSTextView?
@@ -12,9 +44,18 @@ import AppKit
     private var keyDownCount = 0
     private var keyUpCount = 0
     private let readyURL: URL
+    private let nonactivating: Bool
+    private let copyOnly: Bool
+    private let originalWorkspacePID: pid_t?
     private let selectedText = "外部原始选区"
 
-    init(readyURL: URL) { self.readyURL = readyURL }
+    init(readyURL: URL, nonactivating: Bool = false, copyOnly: Bool = false,
+         originalWorkspacePID: pid_t? = nil) {
+        self.readyURL = readyURL
+        self.nonactivating = nonactivating
+        self.copyOnly = copyOnly
+        self.originalWorkspacePID = originalWorkspacePID
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp, .keyDown, .keyUp]) { [weak self] event in
@@ -36,8 +77,18 @@ import AppKit
             }
             return event
         }
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 160),
+        let window: NSWindow
+        if nonactivating {
+            let panel = ExternalSelectionPanel(contentRect: NSRect(x: 0, y: 0, width: 400, height: 160),
+                                               styleMask: [.titled, .closable, .nonactivatingPanel],
+                                               backing: .buffered, defer: false)
+            panel.hidesOnDeactivate = false
+            panel.level = .floating
+            window = panel
+        } else {
+            window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 160),
                               styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+        }
         window.title = "External Selection Fixture"
         window.isReleasedWhenClosed = false
         window.center()
@@ -45,7 +96,14 @@ import AppKit
         scrollView.autoresizingMask = [.width, .height]
         scrollView.hasVerticalScroller = true
         scrollView.drawsBackground = true
-        let textView = NSTextView(frame: scrollView.contentView.bounds)
+        let textView: NSTextView
+        if nonactivating || copyOnly {
+            let native = ExternalSelectionTextView(frame: scrollView.contentView.bounds)
+            native.copyOnly = copyOnly
+            textView = native
+        } else {
+            textView = NSTextView(frame: scrollView.contentView.bounds)
+        }
         textView.autoresizingMask = [.width, .height]
         textView.isEditable = false
         textView.isSelectable = true
@@ -60,19 +118,29 @@ import AppKit
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(textView)
         textView.setSelectedRange(NSRange(location: 0, length: selectedText.utf16.count))
-        NSApp.activate(ignoringOtherApps: true)
+        if !nonactivating { NSApp.activate(ignoringOtherApps: true) }
         readyTask = Task { @MainActor [weak self] in
             guard let self else { return }
             for _ in 0..<50 {
                 try? await Task.sleep(for: .milliseconds(100))
                 guard !Task.isCancelled else { return }
-                if NSWorkspace.shared.frontmostApplication?.processIdentifier == ProcessInfo.processInfo.processIdentifier,
+                let workspacePID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+                let correctWorkspace = self.nonactivating ?
+                    (self.originalWorkspacePID != nil && self.originalWorkspacePID != ProcessInfo.processInfo.processIdentifier &&
+                     workspacePID == self.originalWorkspacePID) :
+                    workspacePID == ProcessInfo.processInfo.processIdentifier
+                if correctWorkspace,
                    window.isVisible, window.isKeyWindow, window.firstResponder === textView,
                    textView.selectedRange() == NSRange(location: 0, length: self.selectedText.utf16.count) {
                     window.displayIfNeeded()
                     do {
                         fputs("fixture-ready pid=\(ProcessInfo.processInfo.processIdentifier) windowNumber=\(window.windowNumber) frame=\(NSStringFromRect(window.frame))\n", stderr)
-                        let json = try JSONSerialization.data(withJSONObject: ["ready": true, "pid": ProcessInfo.processInfo.processIdentifier], options: [.sortedKeys])
+                        let json = try JSONSerialization.data(withJSONObject: [
+                            "ready": true, "pid": ProcessInfo.processInfo.processIdentifier,
+                            "workspacePID": workspacePID ?? -1, "windowNumber": window.windowNumber,
+                            "selectedUTF16Length": textView.selectedRange().length,
+                            "nonactivating": self.nonactivating, "copyOnly": self.copyOnly
+                        ], options: [.sortedKeys])
                         try json.write(to: self.readyURL, options: .atomic)
                     } catch {
                         fputs("Fixture readiness write failed: \(error.localizedDescription)\n", stderr)
@@ -81,7 +149,8 @@ import AppKit
                     return
                 }
             }
-            fputs("Fixture did not become frontmost with its text selected\n", stderr)
+            fputs(self.nonactivating ? "Fixture did not retain the original frontmost app with its panel key and text selected\n" :
+                  "Fixture did not become frontmost with its text selected\n", stderr)
             NSApp.terminate(nil)
         }
     }
@@ -96,14 +165,18 @@ import AppKit
     @MainActor static func main() {
         let arguments = CommandLine.arguments
         if let index = arguments.firstIndex(of: "--ready"), arguments.indices.contains(index + 1) {
+            let nonactivating = arguments.contains("--nonactivating")
+            let originalWorkspacePID = NSWorkspace.shared.frontmostApplication?.processIdentifier
             let app = NSApplication.shared
-            app.setActivationPolicy(.regular)
-            let delegate = ExternalSelectionFixtureDelegate(readyURL: URL(fileURLWithPath: arguments[index + 1]))
+            app.setActivationPolicy(nonactivating ? .accessory : .regular)
+            let delegate = ExternalSelectionFixtureDelegate(readyURL: URL(fileURLWithPath: arguments[index + 1]),
+                nonactivating: nonactivating, copyOnly: arguments.contains("--copy-only"),
+                originalWorkspacePID: originalWorkspacePID)
             app.delegate = delegate
             app.run()
             withExtendedLifetime(delegate) {}
         } else {
-            fputs("Usage: ExternalSelectionFixture --ready /absolute/path/ready.json\n", stderr)
+            fputs("Usage: ExternalSelectionFixture --ready /absolute/path/ready.json [--nonactivating] [--copy-only]\n", stderr)
             exit(2)
         }
     }

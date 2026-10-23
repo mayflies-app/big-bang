@@ -1,7 +1,14 @@
 import Foundation
 import BigBangCore
 
+/// Identifies one captured keyboard focus, independently of the active application.
+struct SelectionTarget: Sendable, Equatable {
+    let pid: Int32
+    let identity: UUID
+}
+
 struct AccessibilitySelection: Sendable {
+    var target: SelectionTarget?
     var isSecure = false
     var isSecureCheckUncertain = false
     var text: String?
@@ -59,6 +66,7 @@ private final class SelectionCopyCancellation: @unchecked Sendable {
     var frontmostPID: Int32? { get }
     var ownPID: Int32 { get }
     func selection(pid: Int32) async -> AccessibilitySelection
+    func isCurrentTarget(_ target: SelectionTarget) async -> Bool
     func shortcutIsHeld(keyCode: UInt16?) -> Bool
     func clipboardSnapshot() -> ClipboardSnapshot
     var clipboard: SelectionClipboard { get }
@@ -84,12 +92,17 @@ private final class SelectionCopyCancellation: @unchecked Sendable {
                      onCopiedClipboard: ((SelectionCopyObservation) -> Void)? = nil) async throws -> String {
         try Task.checkCancellation()
         guard environment.isTrusted else { throw ValidationError("请先在系统设置 → 隐私与安全性 → 辅助功能中允许大爆炸，然后再次触发快捷键。") }
-        guard let pid = environment.frontmostPID, pid != environment.ownPID else {
+        guard let pid = environment.frontmostPID else {
             throw ValidationError("请先在其他应用中选中文本，再按快捷键。")
         }
         let selection = await environment.selection(pid: pid)
         try Task.checkCancellation()
-        guard environment.frontmostPID == pid else { throw ValidationError("前台应用已改变，请重新选择并触发。") }
+        guard let target = selection.target else {
+            throw ValidationError("当前应用没有提供可读取的选中文本。可在设置中启用复制回退，或换一个支持辅助功能的应用。")
+        }
+        guard target.pid != environment.ownPID else { throw ValidationError("请先在其他应用中选中文本，再按快捷键。") }
+        try await verifyTarget(target, workspacePID: pid, environment: environment)
+        try Task.checkCancellation()
         guard !selection.isSecure else { throw ValidationError("密码输入框中的文本不会被读取。") }
         guard !selection.isSecureCheckUncertain else {
             throw ValidationError("当前应用没有提供可读取的选中文本。可在设置中启用复制回退，或换一个支持辅助功能的应用。")
@@ -103,7 +116,7 @@ private final class SelectionCopyCancellation: @unchecked Sendable {
             // An unstructured task does not inherit the caller's cancellation.
             // Once copy is posted, keep its original observation/restore lifetime.
             let transaction = Task { @MainActor in
-                try await copiedSelection(pid: pid, triggerKeyCode: triggerKeyCode,
+                try await copiedSelection(target: target, workspacePID: pid, triggerKeyCode: triggerKeyCode,
                     metadataGracePolls: selection.isEditorInput && (selection.rangeLength ?? 0) <= 0 ? 3 : 0,
                     environment: environment, cancellation: cancellation,
                     onClipboardPhase: onClipboardPhase, onCopiedClipboard: onCopiedClipboard)
@@ -123,44 +136,77 @@ private final class SelectionCopyCancellation: @unchecked Sendable {
     }
     private static func hasText(_ text: String) -> Bool { !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 
-    private static func copiedSelection(pid: Int32, triggerKeyCode: UInt16?, metadataGracePolls: Int,
+    private static func verifyTarget(_ target: SelectionTarget, workspacePID: Int32,
+                                     environment: any SelectionEnvironment) async throws {
+        guard environment.frontmostPID == workspacePID,
+              await environment.isCurrentTarget(target),
+              environment.frontmostPID == workspacePID else {
+            throw ValidationError("文本焦点已改变，请重新选择并触发。")
+        }
+    }
+
+    private static func copiedSelection(target: SelectionTarget, workspacePID: Int32,
+                                        triggerKeyCode: UInt16?, metadataGracePolls: Int,
                                         environment: any SelectionEnvironment, cancellation: SelectionCopyCancellation,
                                         onClipboardPhase: (@MainActor (SelectionClipboardPhase) -> Void)?,
                                         onCopiedClipboard: ((SelectionCopyObservation) -> Void)?) async throws -> String {
         // Carbon fires on key-down. Don't send Command-C while the triggering chord is held.
+        let releaseDeadline = ContinuousClock.now.advanced(by: .seconds(2))
         for _ in 0..<100 {
             try cancellation.check()
-            guard environment.frontmostPID == pid else { throw ValidationError("前台应用已改变，请重新选择并触发。") }
+            try await verifyTarget(target, workspacePID: workspacePID, environment: environment)
             if !environment.shortcutIsHeld(keyCode: triggerKeyCode) { break }
+            if ContinuousClock.now >= releaseDeadline { break }
             try await environment.pause(milliseconds: 20)
         }
         guard !environment.shortcutIsHeld(keyCode: triggerKeyCode) else { throw ValidationError("请松开快捷键后重新触发，以便复制选中文本。") }
         try cancellation.check()
-        let saved = environment.clipboardSnapshot()
-        guard environment.frontmostPID == pid else { throw ValidationError("前台应用已改变，请重新选择并触发。") }
+        var saved: ClipboardSnapshot?
         let marker = UUID().uuidString
         var ownedCount = 0
         var markerInstalled = false
         defer {
-            if markerInstalled, environment.clipboard.changeCount == ownedCount { environment.restoreClipboard(saved) }
+            if markerInstalled, let saved, environment.clipboard.changeCount == ownedCount { environment.restoreClipboard(saved) }
             onClipboardPhase?(.ended)
         }
         onClipboardPhase?(.began)
         try cancellation.check()
-        guard environment.frontmostPID == pid else { throw ValidationError("前台应用已改变，请重新选择并触发。") }
+        try await verifyTarget(target, workspacePID: workspacePID, environment: environment)
+        try cancellation.check()
+        // Do not suspend between snapshot and posting: a clipboard write during
+        // asynchronous focus verification must become the snapshot we restore.
+        saved = environment.clipboardSnapshot()
+        guard environment.frontmostPID == workspacePID else { throw ValidationError("前台应用已改变，请重新选择并触发。") }
         environment.installMarker(marker)
         markerInstalled = true
         ownedCount = environment.clipboard.changeCount
         // This lock defines the atomic cancellation boundary: cancellation that
         // wins it prevents posting; once posting wins, polling is allowed to drain.
-        try cancellation.post { try environment.sendCopy(pid: pid) }
+        try cancellation.post { try environment.sendCopy(pid: target.pid) }
         var changed = false
         var firstTextPoll: Int?
+        var focusError: Error?
+        let copyDeadline = ContinuousClock.now.advanced(by: .milliseconds(1200))
         for poll in 0..<40 {
             try await environment.pause(milliseconds: 30)
-            guard environment.frontmostPID == pid else { throw ValidationError("复制期间前台应用改变，请重试。") }
+            if focusError == nil {
+                do { try await verifyTarget(target, workspacePID: workspacePID, environment: environment) }
+                catch { focusError = error }
+            }
             let clipboard = environment.clipboard
-            guard clipboard.isStable else { continue }
+            if let focusError {
+                // A posted copy may still arrive after focus is lost. Do not
+                // restore the marker early and let that late write overwrite it.
+                // New writes now have uncertain ownership, so preserve them.
+                if clipboard.changeCount != ownedCount || ContinuousClock.now >= copyDeadline || poll == 39 {
+                    throw focusError
+                }
+                continue
+            }
+            guard clipboard.isStable else {
+                if ContinuousClock.now >= copyDeadline { break }
+                continue
+            }
             if clipboard.changeCount != ownedCount {
                 ownedCount = clipboard.changeCount
                 changed = true
@@ -176,11 +222,13 @@ private final class SelectionCopyCancellation: @unchecked Sendable {
                 case .absent:
                     // Electron's native copy workaround and extensions may only write text.
                     // Give delayed metadata a short opportunity, then accept the fresh copy.
-                    if poll - (firstTextPoll ?? poll) < metadataGracePolls { continue }
+                    if poll - (firstTextPoll ?? poll) < metadataGracePolls,
+                       ContinuousClock.now < copyDeadline { continue }
                 case .selection: break
                 }
                 return try checked(text)
             }
+            if ContinuousClock.now >= copyDeadline { break }
         }
         if changed { throw ValidationError("选择的内容不是文本，或复制尚未完成。") }
         throw ValidationError("未能复制选中文本。请确认当前应用支持 ⌘C 且已选中文本。")

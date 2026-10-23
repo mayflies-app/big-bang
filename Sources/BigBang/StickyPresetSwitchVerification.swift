@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import Combine
 import BigBangCore
 import BigBangSelection
@@ -1000,7 +1001,7 @@ extension StickyPresetSwitchVerification {
         let report: [String: Any] = ["passed": !checks.isEmpty && checks.values.allSatisfy { $0 } && errors.isEmpty,
             "checks": checks, "errors": errors, "requestCount": requests.count,
             "diagnostics": diagnostics,
-            "scope": "Packaged nonactivating panel; production selection-to-note path with injected selection failures and request sink; native editor composition, private-pasteboard paste, accessibility submit/cancel-edit and NSApp.sendEvent keyboard routing. Cancel-edit verifies restored result snapshots and stopped-stream isolation. Copy feedback uses deterministic published output deltas; the general clipboard is fully materialized by item/type before copying and restored byte-for-byte only if no external write is detected. An explicitly supplied loopback endpoint additionally exercises both real streaming API clients. Conditional nativeAX checks run only with --fixture-app: real AX-only SelectionReader against an owned foreground ExternalSelectionFixture, without sending copy. No live model, Keychain access, global hotkey registration or settings writes. Installed IME candidate UI and physical hotkey are not exercised."]
+            "scope": "Packaged nonactivating panel; production selection-to-note path with injected selection failures and request sink; native editor composition, private-pasteboard paste, accessibility submit/cancel-edit and NSApp.sendEvent keyboard routing. Cancel-edit verifies restored result snapshots and stopped-stream isolation. Copy feedback uses deterministic published output deltas; the general clipboard is fully materialized by item/type before copying and restored byte-for-byte only if no external write is detected. An explicitly supplied loopback endpoint additionally exercises both real streaming API clients. Conditional nativeAX checks run only with --fixture-app: real SelectionReader against owned ordinary and nonactivating ExternalSelectionFixture windows, plus a nonactivating copy-only selection that hides AX text and receives targeted native copy. Each process has a fresh readiness report, owned termination and frontmost-app restoration; copy phases and complete in-memory item/type snapshots verify clipboard preservation without writing a test restoration. No live model, Keychain access, global hotkey registration or settings writes. Installed IME candidate UI and physical hotkey are not exercised."]
         do {
             try FileManager.default.createDirectory(at: reportURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]).write(to: reportURL, options: .atomic)
@@ -1020,48 +1021,179 @@ extension StickyPresetSwitchVerification {
                     ["nativeAX.included": true, "nativeAX.error": "Expected the owned external selection fixture bundle"])
         }
         checks["nativeAX.fixtureArgumentIsValid"] = true
-        let previousFrontmost = NSWorkspace.shared.frontmostApplication
-        let readyURL = reportURL.deletingLastPathComponent()
-            .appendingPathComponent("native-ax-fixture-ready-\(UUID().uuidString).json")
-        let fixture = Process()
-        fixture.executableURL = fixtureURL.appendingPathComponent("Contents/MacOS/ExternalSelectionFixture")
-        fixture.arguments = ["--ready", readyURL.path]
-        var launched = false
-        do {
-            try FileManager.default.createDirectory(at: readyURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try fixture.run()
-            launched = true
-            diagnostics["nativeAX.fixturePID"] = fixture.processIdentifier
-            diagnostics["nativeAX.readyReport"] = readyURL.path
-            let ready = await waitFor {
-                guard let data = try? Data(contentsOf: readyURL),
-                      let report = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
-                return report["ready"] as? Bool == true &&
-                    (report["pid"] as? NSNumber)?.int32Value == fixture.processIdentifier &&
-                    NSWorkspace.shared.frontmostApplication?.processIdentifier == fixture.processIdentifier
+        let expected = "外部原始选区"
+        // Diagnostic samples only: never use these later observations to change
+        // SelectionReader's verdict or infer what its private snapshot captured.
+        func focusedUISnapshot() -> (element: AXUIElement?, metadata: [String: Any]) {
+            let began = ProcessInfo.processInfo.systemUptime
+            let system = AXUIElementCreateSystemWide()
+            AXUIElementSetMessagingTimeout(system, 0.04)
+            var value: CFTypeRef?
+            let status = AXUIElementCopyAttributeValue(system, kAXFocusedUIElementAttribute as CFString, &value)
+            var metadata: [String: Any] = ["axError": status.rawValue,
+                "workspacePID": NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1,
+                "uptimeSeconds": began]
+            guard status == .success, let value, CFGetTypeID(value) == AXUIElementGetTypeID() else {
+                metadata["available"] = false
+                metadata["elapsedMilliseconds"] = (ProcessInfo.processInfo.systemUptime - began) * 1000
+                return (nil, metadata)
             }
-            checks["nativeAX.fixtureBecameReadyAndFrontmost"] = ready
-            if ready {
-                let began = ProcessInfo.processInfo.systemUptime
-                defer { diagnostics["nativeAX.millisecondsToRead"] = (ProcessInfo.processInfo.systemUptime - began) * 1000 }
-                let selection = try await SelectionReader.read(copyFallback: false)
-                checks["nativeAX.realSelectionMatchesFixture"] = selection == "外部原始选区"
-                diagnostics["nativeAX.selectionUTF8Bytes"] = selection.utf8.count
-            } else {
-                checks["nativeAX.realSelectionMatchesFixture"] = false
+            let element = unsafeBitCast(value, to: AXUIElement.self)
+            AXUIElementSetMessagingTimeout(element, 0.04)
+            var pid: pid_t = 0
+            let pidStatus = AXUIElementGetPid(element, &pid)
+            AXUIElementSetMessagingTimeout(element, 0.04)
+            var role: CFTypeRef?
+            let roleStatus = AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role)
+            metadata["available"] = true
+            metadata["pid"] = Int(pid)
+            metadata["pidError"] = pidStatus.rawValue
+            metadata["role"] = role as? String ?? ""
+            metadata["roleError"] = roleStatus.rawValue
+            metadata["elapsedMilliseconds"] = (ProcessInfo.processInfo.systemUptime - began) * 1000
+            return (element, metadata)
+        }
+        func focusComparison(_ before: (element: AXUIElement?, metadata: [String: Any]),
+                             _ after: (element: AXUIElement?, metadata: [String: Any])) -> [String: Any] {
+            var result: [String: Any] = ["before": before.metadata, "after": after.metadata,
+                                       "comparisonSamplesAreObservational": true]
+            if let original = before.element, let current = after.element {
+                result["sameElement"] = CFEqual(original, current)
             }
-        } catch {
-            checks["nativeAX.realSelectionMatchesFixture"] = false
-            diagnostics["nativeAX.error"] = String(describing: error)
+            return result
         }
-        if launched {
-            if fixture.isRunning { fixture.terminate() }
-            checks["nativeAX.ownedFixtureTerminated"] = await waitFor { !fixture.isRunning }
+        // Materialize every representation in memory. Only comparison booleans
+        // enter the report; SelectionReader alone owns clipboard restoration.
+        func clipboardSnapshot() -> (items: [[String: Data]], complete: Bool) {
+            let board = NSPasteboard.general
+            let change = board.changeCount
+            var items: [[String: Data]] = []
+            var complete = true
+            for item in board.pasteboardItems ?? [] {
+                var representations: [String: Data] = [:]
+                for type in item.types {
+                    if let data = item.data(forType: type) { representations[type.rawValue] = data }
+                    else { complete = false }
+                }
+                items.append(representations)
+            }
+            return (items, complete && board.changeCount == change)
         }
-        if let previousFrontmost {
-            previousFrontmost.activate(options: [])
-            checks["nativeAX.previousFrontmostRestored"] = await waitFor {
-                NSWorkspace.shared.frontmostApplication?.processIdentifier == previousFrontmost.processIdentifier
+        let scenarios: [(name: String, nonactivating: Bool, copyOnly: Bool)] = [
+            ("", false, false), ("nonactivating.", true, false), ("nonactivatingCopyOnly.", true, true)
+        ]
+        for scenario in scenarios {
+            // Keep the ordinary scenario's original check and diagnostic keys.
+            let prefix = "nativeAX." + scenario.name
+            let previousFrontmost = NSWorkspace.shared.frontmostApplication
+            let originalWorkspacePID = previousFrontmost?.processIdentifier
+            let readyURL = reportURL.deletingLastPathComponent()
+                .appendingPathComponent("native-ax-fixture-\(scenario.name)ready-\(UUID().uuidString).json")
+            let fixture = Process()
+            fixture.executableURL = fixtureURL.appendingPathComponent("Contents/MacOS/ExternalSelectionFixture")
+            fixture.arguments = ["--ready", readyURL.path] +
+                (scenario.nonactivating ? ["--nonactivating"] : []) + (scenario.copyOnly ? ["--copy-only"] : [])
+            var launched = false
+            do {
+                try FileManager.default.createDirectory(at: readyURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try fixture.run()
+                launched = true
+                diagnostics[prefix + "fixturePID"] = fixture.processIdentifier
+                diagnostics[prefix + "readyReport"] = readyURL.path
+                diagnostics[prefix + "originalWorkspacePID"] = originalWorkspacePID ?? -1
+                let ready = await waitFor {
+                    guard let data = try? Data(contentsOf: readyURL),
+                          let report = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          report["ready"] as? Bool == true,
+                          (report["pid"] as? NSNumber)?.int32Value == fixture.processIdentifier,
+                          report["nonactivating"] as? Bool == scenario.nonactivating,
+                          report["copyOnly"] as? Bool == scenario.copyOnly,
+                          (report["selectedUTF16Length"] as? NSNumber)?.intValue == expected.utf16.count,
+                          (report["windowNumber"] as? NSNumber)?.intValue ?? 0 > 0 else { return false }
+                    let workspacePID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+                    if scenario.nonactivating {
+                        return originalWorkspacePID != nil && workspacePID == originalWorkspacePID &&
+                            workspacePID != fixture.processIdentifier &&
+                            (report["workspacePID"] as? NSNumber)?.int32Value == originalWorkspacePID
+                    }
+                    return workspacePID == fixture.processIdentifier &&
+                        (report["workspacePID"] as? NSNumber)?.int32Value == fixture.processIdentifier
+                }
+                checks[prefix + (scenario.nonactivating ? "fixtureBecameReadyWithoutActivation" : "fixtureBecameReadyAndFrontmost")] = ready
+                if ready {
+                    let before = clipboardSnapshot()
+                    checks[prefix + "clipboardSnapshotBeforeComplete"] = before.complete
+                    var phases: [String] = []
+                    var copiedTypes: [[String]] = []
+                    var copiedExpected: [Bool] = []
+                    let began = ProcessInfo.processInfo.systemUptime
+                    do {
+                        if scenario.copyOnly {
+                            do {
+                                let focusBefore = focusedUISnapshot()
+                                defer {
+                                    diagnostics[prefix + "axOnlyProbeFocus"] = focusComparison(focusBefore, focusedUISnapshot())
+                                }
+                                let unexpected = try await SelectionReader.read(copyFallback: false)
+                                checks[prefix + "axOnlyRejectsHiddenSelection"] = false
+                                diagnostics[prefix + "unexpectedAXSelectionUTF8Bytes"] = unexpected.utf8.count
+                            } catch {
+                                checks[prefix + "axOnlyRejectsHiddenSelection"] = true
+                                diagnostics[prefix + "axOnlyError"] = error.localizedDescription
+                            }
+                        }
+                        // Never enter a copy transaction after an incomplete snapshot.
+                        if !scenario.copyOnly || before.complete {
+                            let focusBefore = focusedUISnapshot()
+                            defer {
+                                diagnostics[prefix + "selectionReadFocus"] = focusComparison(focusBefore, focusedUISnapshot())
+                            }
+                            let selection = try await SelectionReader.read(copyFallback: scenario.copyOnly,
+                                onClipboardPhase: { phase in phases.append(phase == .began ? "began" : "ended") },
+                                onCopiedClipboard: { observation in
+                                    copiedTypes.append(observation.types.sorted())
+                                    copiedExpected.append(observation.text == expected)
+                                })
+                            checks[prefix + "realSelectionMatchesFixture"] = selection == expected
+                            diagnostics[prefix + "selectionUTF8Bytes"] = selection.utf8.count
+                        } else { checks[prefix + "realSelectionMatchesFixture"] = false }
+                    } catch {
+                        checks[prefix + "realSelectionMatchesFixture"] = false
+                        diagnostics[prefix + "error"] = error.localizedDescription
+                    }
+                    diagnostics[prefix + "millisecondsToRead"] = (ProcessInfo.processInfo.systemUptime - began) * 1000
+                    diagnostics[prefix + "clipboardPhases"] = phases
+                    diagnostics[prefix + "copiedTypes"] = copiedTypes
+                    if scenario.copyOnly {
+                        checks[prefix + "copyTransactionCompletes"] = phases == ["began", "ended"]
+                        checks[prefix + "copyContainsExpectedSelection"] = copiedExpected == [true] &&
+                            copiedTypes.count == 1 && !copiedTypes[0].isEmpty
+                    } else {
+                        checks[prefix + "axOnlyDoesNotCopy"] = phases.isEmpty && copiedTypes.isEmpty
+                    }
+                    let after = clipboardSnapshot()
+                    checks[prefix + "clipboardSnapshotAfterComplete"] = after.complete
+                    checks[prefix + "clipboardPreservesEveryRepresentation"] = before.complete && after.complete && before.items == after.items
+                    if scenario.nonactivating {
+                        let workspacePID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+                        checks[prefix + "workspaceRemainsDifferentFromFixture"] = workspacePID == originalWorkspacePID &&
+                            workspacePID != fixture.processIdentifier
+                        diagnostics[prefix + "workspacePIDAfterRead"] = workspacePID ?? -1
+                    }
+                } else { checks[prefix + "realSelectionMatchesFixture"] = false }
+            } catch {
+                checks[prefix + "realSelectionMatchesFixture"] = false
+                diagnostics[prefix + "error"] = String(describing: error)
+            }
+            if launched {
+                if fixture.isRunning { fixture.terminate() }
+                checks[prefix + "ownedFixtureTerminated"] = await waitFor { !fixture.isRunning }
+            }
+            if let previousFrontmost {
+                previousFrontmost.activate(options: [])
+                checks[prefix + "previousFrontmostRestored"] = await waitFor {
+                    NSWorkspace.shared.frontmostApplication?.processIdentifier == previousFrontmost.processIdentifier
+                }
             }
         }
         return (checks, diagnostics)

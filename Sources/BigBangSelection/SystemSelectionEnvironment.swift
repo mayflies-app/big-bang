@@ -2,8 +2,18 @@ import AppKit
 import ApplicationServices
 import BigBangCore
 
-@MainActor struct SystemSelectionEnvironment: SelectionEnvironment {
+@MainActor final class SystemSelectionEnvironment: SelectionEnvironment {
     private let pasteboard: NSPasteboard
+    private var capturedFocus: FocusSnapshot?
+
+    // Immutable AX handles are used only by bounded background AX requests.
+    private struct FocusSnapshot: @unchecked Sendable {
+        enum Origin { case system, application }
+        let target: SelectionTarget
+        let workspacePID: Int32
+        let origin: Origin
+        let element: AXUIElement?
+    }
     init(pasteboard: NSPasteboard = .general) { self.pasteboard = pasteboard }
     var isTrusted: Bool { AXIsProcessTrusted() }
     var frontmostPID: Int32? { NSWorkspace.shared.frontmostApplication?.processIdentifier }
@@ -17,24 +27,73 @@ import BigBangCore
     func selection(pid: Int32) async -> AccessibilitySelection {
         // AX messaging can block on an unresponsive source app. Keep only those C
         // calls off the main actor so the note can appear while capture finishes.
-        await Task.detached(priority: .userInitiated) {
-            Self.accessibilitySelection(pid: pid)
+        let (selection, focus) = await Task.detached(priority: .userInitiated) {
+            let deadline = ContinuousClock.now.advanced(by: .milliseconds(120))
+            guard let focus = Self.resolveFocus(workspacePID: pid, deadline: deadline) else {
+                return (AccessibilitySelection(isSecureCheckUncertain: true), Optional<FocusSnapshot>.none)
+            }
+            var selection = Self.accessibilitySelection(focus: focus, deadline: deadline)
+            selection.target = focus.target
+            return (selection, Optional(focus))
         }.value
+        capturedFocus = focus
+        return selection
     }
 
-    private nonisolated static func accessibilitySelection(pid: Int32) -> AccessibilitySelection {
-        let deadline = ContinuousClock.now.advanced(by: .milliseconds(120))
-        let app = AXUIElementCreateApplication(pid)
-        let (focusStatus, focused) = attribute(app, kAXFocusedUIElementAttribute, deadline: deadline)
+    func isCurrentTarget(_ target: SelectionTarget) async -> Bool {
+        guard let captured = capturedFocus, captured.target == target,
+              frontmostPID == captured.workspacePID else { return false }
+        let matches = await Task.detached(priority: .userInitiated) {
+            let deadline = ContinuousClock.now.advanced(by: .milliseconds(40))
+            guard let current = Self.resolveFocus(workspacePID: captured.workspacePID, deadline: deadline),
+                  current.target.pid == target.pid, current.origin == captured.origin else { return false }
+            switch (captured.element, current.element) {
+            case let (original?, current?): return CFEqual(original, current)
+            case (nil, nil): return true
+            default: return false
+            }
+        }.value
+        return matches && frontmostPID == captured.workspacePID
+    }
+
+    private nonisolated static func resolveFocus(workspacePID: Int32,
+                                                 deadline: ContinuousClock.Instant) -> FocusSnapshot? {
+        let system = AXUIElementCreateSystemWide()
+        let (status, focused) = attribute(system, kAXFocusedUIElementAttribute, deadline: deadline)
+        if status == .success {
+            return snapshot(focused, workspacePID: workspacePID, origin: .system)
+        }
+        // Nonactivating panels can hold keyboard focus while NSWorkspace still
+        // names the underlying app. Never replace a valid system focus with that
+        // app's old selection. Only an explicitly unavailable attribute permits
+        // the legacy application lookup; messaging errors fail closed.
+        guard status == .attributeUnsupported || status == .noValue else { return nil }
+        let app = AXUIElementCreateApplication(workspacePID)
+        let (appStatus, appFocused) = attribute(app, kAXFocusedUIElementAttribute, deadline: deadline)
+        if appStatus == .success {
+            return snapshot(appFocused, workspacePID: workspacePID, origin: .application)
+        }
+        guard appStatus == .attributeUnsupported || appStatus == .noValue else { return nil }
+        return FocusSnapshot(target: .init(pid: workspacePID, identity: UUID()),
+                             workspacePID: workspacePID, origin: .application, element: nil)
+    }
+
+    private nonisolated static func snapshot(_ value: CFTypeRef?, workspacePID: Int32,
+                                             origin: FocusSnapshot.Origin) -> FocusSnapshot? {
+        guard let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+        let element = unsafeBitCast(value, to: AXUIElement.self)
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(element, &pid) == .success, pid > 0 else { return nil }
+        return FocusSnapshot(target: .init(pid: pid, identity: UUID()),
+                             workspacePID: workspacePID, origin: origin, element: element)
+    }
+
+    private nonisolated static func accessibilitySelection(focus: FocusSnapshot,
+                                                          deadline: ContinuousClock.Instant) -> AccessibilitySelection {
         // If the budget expires before editor classification, retain its metadata
         // grace period rather than accepting a possible whole-line editor copy.
         var result = AccessibilitySelection(isEditorInput: true)
-        if focusStatus == .cannotComplete {
-            result.isSecureCheckUncertain = true
-            return result
-        }
-        guard let focused, CFGetTypeID(focused) == AXUIElementGetTypeID() else { return result }
-        let element = unsafeBitCast(focused, to: AXUIElement.self)
+        guard let element = focus.element else { return result }
         let (subroleStatus, subrole) = attribute(element, kAXSubroleAttribute, deadline: deadline)
         if subrole as? String == "AXSecureTextField" { return AccessibilitySelection(isSecure: true) }
         guard subroleStatus == .success || subroleStatus == .attributeUnsupported || subroleStatus == .noValue else {
@@ -135,7 +194,10 @@ import BigBangCore
         if !items.isEmpty { board.writeObjects(items) }
     }
     func sendCopy(pid: Int32) throws {
-        guard frontmostPID == pid else { throw ValidationError("前台应用已改变，请重新选择并触发。") }
+        guard let capturedFocus, capturedFocus.target.pid == pid,
+              frontmostPID == capturedFocus.workspacePID else {
+            throw ValidationError("前台应用已改变，请重新选择并触发。")
+        }
         guard let source = CGEventSource(stateID: .privateState),
               let down = CGEvent(keyboardEventSource: source, virtualKey: 8, keyDown: true),
               let up = CGEvent(keyboardEventSource: source, virtualKey: 8, keyDown: false) else {

@@ -7,6 +7,13 @@ import BigBangCore
     var frontmostPID: Int32? = 42
     var ownPID: Int32 = 99
     var ax = AccessibilitySelection()
+    var currentTarget: SelectionTarget?
+    var selectionPIDs: [Int32] = []
+    var copiedPIDs: [Int32] = []
+    var checkedTargets: [SelectionTarget] = []
+    var events: [String] = []
+    var snapshotContents: [ClipboardSnapshot] = []
+    private var selectionWorkspacePID: Int32?
     var clipboard = SelectionClipboard(changeCount: 7, text: "Old clipboard")
     var storedClipboard: ClipboardSnapshot = [["public.utf8-plain-text": Data("Old clipboard".utf8), "public.rtf": Data([1, 2, 3])]]
     var copiedText: String? = "Selected in editor"
@@ -22,16 +29,35 @@ import BigBangCore
     var copyError: Error?
     var onPause: ((SelectionFixture) throws -> Void)?
     var onSelection: (() async -> Void)?
+    var onTargetCheck: ((SelectionFixture, SelectionTarget) async -> Bool)?
+
+    init() { setTarget(SelectionTarget(pid: 42, identity: UUID())) }
+    func setTarget(_ target: SelectionTarget?) { ax.target = target; currentTarget = target }
 
     func selection(pid: Int32) async -> AccessibilitySelection {
+        selectionPIDs.append(pid); selectionWorkspacePID = pid
         await onSelection?()
         return ax
     }
+    func isCurrentTarget(_ target: SelectionTarget) async -> Bool {
+        checkedTargets.append(target); events.append("target.begin")
+        let valid: Bool
+        if let onTargetCheck { valid = await onTargetCheck(self, target) }
+        else { valid = currentTarget == target && frontmostPID == selectionWorkspacePID }
+        events.append("target.end")
+        return valid
+    }
     func shortcutIsHeld(keyCode: UInt16?) -> Bool { pauses < heldForPauses }
-    func clipboardSnapshot() -> ClipboardSnapshot { snapshots += 1; return storedClipboard }
-    func installMarker(_ marker: String) { markerWrites += 1; clipboard = .init(changeCount: clipboard.changeCount + 1, text: nil) }
-    func restoreClipboard(_ snapshot: ClipboardSnapshot) { restores += 1; storedClipboard = snapshot; clipboard.changeCount += 1; clipboard.text = "Old clipboard" }
+    func clipboardSnapshot() -> ClipboardSnapshot {
+        events.append("snapshot"); snapshots += 1; snapshotContents.append(storedClipboard); return storedClipboard
+    }
+    func installMarker(_ marker: String) { events.append("marker"); markerWrites += 1; clipboard = .init(changeCount: clipboard.changeCount + 1, text: nil) }
+    func restoreClipboard(_ snapshot: ClipboardSnapshot) {
+        restores += 1; storedClipboard = snapshot; clipboard.changeCount += 1
+        clipboard.text = snapshot.first?["public.utf8-plain-text"].flatMap { String(data: $0, encoding: .utf8) }
+    }
     func sendCopy(pid: Int32) throws {
+        events.append("copy"); copiedPIDs.append(pid)
         if let copyError { throw copyError }
         copySent = true; sentWhileHeld = shortcutIsHeld(keyCode: nil)
     }
@@ -221,7 +247,7 @@ final class SelectionReaderTests: XCTestCase {
         let fixture = SelectionFixture(); fixture.ax.text = "Old source selection"
         fixture.onSelection = { fixture.frontmostPID = 43 }
         do { _ = try await SelectionReader.read(copyFallback: true, environment: fixture); XCTFail("Old source text must not be returned") }
-        catch { XCTAssertTrue(error.localizedDescription.contains("前台应用")) }
+        catch { XCTAssertTrue(error.localizedDescription.contains("文本焦点")) }
         XCTAssertFalse(fixture.copySent); XCTAssertEqual(fixture.snapshots, 0)
     }
 
@@ -234,7 +260,7 @@ final class SelectionReaderTests: XCTestCase {
     }
 
     @MainActor func testFocusChangeDoesNotOverwriteNewClipboard() async {
-        for (language, expectedError) in [(AppLanguage.simplifiedChinese, "前台应用"), (.english, "foreground app")] {
+        for (language, expectedError) in [(AppLanguage.simplifiedChinese, "文本焦点"), (.english, "Text focus")] {
             L10n.currentLanguage = language
             let fixture = SelectionFixture()
             fixture.onPause = { state in
@@ -415,9 +441,176 @@ final class SelectionReaderTests: XCTestCase {
     @MainActor func testPermissionDeniedAndOwnAppNeverTouchClipboard() async {
         for permissionDenied in [true, false] {
             let fixture = SelectionFixture()
-            if permissionDenied { fixture.isTrusted = false } else { fixture.frontmostPID = fixture.ownPID }
+            if permissionDenied { fixture.isTrusted = false }
+            else { fixture.frontmostPID = fixture.ownPID; fixture.setTarget(SelectionTarget(pid: fixture.ownPID, identity: UUID())) }
             do { _ = try await SelectionReader.read(copyFallback: true, environment: fixture); XCTFail("Expected precondition rejection") } catch {}
             XCTAssertFalse(fixture.copySent); XCTAssertEqual(fixture.snapshots, 0)
         }
+    }
+
+    @MainActor func testAccessibilitySelectionUsesActualTargetWhenWorkspaceNamesAnotherApplication() async throws {
+        for workspacePID: Int32 in [42, 99] {
+            let fixture = SelectionFixture(); fixture.frontmostPID = workspacePID
+            let target = SelectionTarget(pid: 73, identity: UUID())
+            fixture.setTarget(target); fixture.ax.text = "Screenshot helper selection🙂"
+            let selected = try await SelectionReader.read(copyFallback: true, environment: fixture)
+            XCTAssertEqual(selected, fixture.ax.text)
+            XCTAssertEqual(fixture.selectionPIDs, [workspacePID], "AX discovery starts with the workspace application")
+            XCTAssertFalse(fixture.checkedTargets.isEmpty)
+            XCTAssertTrue(fixture.checkedTargets.allSatisfy { $0 == target })
+            XCTAssertFalse(fixture.copySent); XCTAssertEqual(fixture.snapshots, 0)
+        }
+    }
+
+    @MainActor func testCopyTargetsActualAccessibilityApplicationIncludingWhenWorkspaceNamesOwnApp() async throws {
+        for workspacePID: Int32 in [42, 99] {
+            let fixture = SelectionFixture(); fixture.frontmostPID = workspacePID
+            let target = SelectionTarget(pid: 73, identity: UUID())
+            fixture.setTarget(target)
+            let selected = try await SelectionReader.read(copyFallback: true, environment: fixture)
+            XCTAssertEqual(selected, fixture.copiedText)
+            XCTAssertEqual(fixture.selectionPIDs, [workspacePID])
+            XCTAssertEqual(fixture.copiedPIDs, [73])
+            XCTAssertTrue(fixture.checkedTargets.allSatisfy { $0 == target })
+            XCTAssertEqual(fixture.restores, 1)
+        }
+    }
+
+    @MainActor func testMissingOrOwnAccessibilityTargetRejectsEvenReadableAXText() async {
+        for target in [nil, SelectionTarget(pid: 99, identity: UUID())] as [SelectionTarget?] {
+            let fixture = SelectionFixture(); fixture.setTarget(target); fixture.ax.text = "Must not escape target validation"
+            do { _ = try await SelectionReader.read(copyFallback: true, environment: fixture); XCTFail("Missing/own AX target must fail closed") } catch {}
+            XCTAssertFalse(fixture.copySent); XCTAssertEqual(fixture.snapshots, 0)
+        }
+    }
+
+    @MainActor func testTargetIdentityChangesAfterAXRejectStaleTextWithUnchangedWorkspaceAndPID() async {
+        let fixture = SelectionFixture(); fixture.ax.text = "Old focused element selection"
+        fixture.onSelection = { fixture.currentTarget = SelectionTarget(pid: 42, identity: UUID()) }
+        do { _ = try await SelectionReader.read(copyFallback: true, environment: fixture); XCTFail("A new identity in the same PID invalidates AX text") } catch {}
+        XCTAssertEqual(fixture.frontmostPID, 42)
+        XCTAssertFalse(fixture.copySent); XCTAssertEqual(fixture.snapshots, 0)
+    }
+
+    @MainActor func testTargetChangeDuringShortcutReleaseNeverTouchesClipboard() async {
+        let fixture = SelectionFixture(); fixture.heldForPauses = 3
+        fixture.onPause = { state in state.currentTarget = SelectionTarget(pid: 73, identity: UUID()) }
+        do { _ = try await SelectionReader.read(copyFallback: true, environment: fixture); XCTFail("Actual target changed while workspace stayed constant") } catch {}
+        XCTAssertEqual(fixture.frontmostPID, 42)
+        XCTAssertFalse(fixture.copySent); XCTAssertEqual(fixture.snapshots, 0); XCTAssertEqual(fixture.markerWrites, 0)
+    }
+
+    @MainActor func testTargetLostAtClipboardBeginNeverWritesMarkerOrPostsCopy() async {
+        let fixture = SelectionFixture()
+        var phases: [SelectionClipboardPhase] = []
+        do {
+            _ = try await SelectionReader.read(copyFallback: true, environment: fixture, onClipboardPhase: { phase in
+                phases.append(phase)
+                if phase == .began { fixture.currentTarget = nil }
+            })
+            XCTFail("Revalidate the actual target before owning the clipboard")
+        } catch {}
+        XCTAssertEqual(phases, [.began, .ended])
+        XCTAssertFalse(fixture.copySent); XCTAssertEqual(fixture.markerWrites, 0); XCTAssertEqual(fixture.restores, 0)
+        XCTAssertEqual(fixture.clipboard.text, "Old clipboard")
+    }
+
+    @MainActor func testTargetChangeAfterPostingPreservesNewExternalClipboard() async {
+        let fixture = SelectionFixture()
+        fixture.onPause = { state in
+            state.currentTarget = SelectionTarget(pid: 73, identity: UUID())
+            state.clipboard = .init(changeCount: state.clipboard.changeCount + 1, text: "New user copy from changed target")
+        }
+        do { _ = try await SelectionReader.read(copyFallback: true, environment: fixture); XCTFail("Changed target's clipboard is not the captured selection") } catch {}
+        XCTAssertTrue(fixture.copySent); XCTAssertEqual(fixture.frontmostPID, 42)
+        XCTAssertEqual(fixture.restores, 0); XCTAssertEqual(fixture.clipboard.text, "New user copy from changed target")
+    }
+
+    @MainActor func testTargetLossAfterPostingWaitsForLateCopyWithoutRestoringMarkerEarly() async {
+        let fixture = SelectionFixture()
+        fixture.onPause = { state in
+            XCTAssertEqual(state.restores, 0, "A posted copy can still arrive after target validation fails")
+            if state.pauses == 1 {
+                state.currentTarget = nil
+                XCTAssertNil(state.clipboard.text, "The first observation still sees the probe marker")
+                XCTAssertEqual(state.frontmostPID, 42)
+            } else if state.pauses == 2 {
+                state.clipboard = .init(changeCount: state.clipboard.changeCount + 1, text: "Late copy after focus loss")
+            }
+        }
+        do {
+            _ = try await SelectionReader.read(copyFallback: true, environment: fixture)
+            XCTFail("A late copy after target loss must never be returned as selected text")
+        } catch { XCTAssertTrue(error.localizedDescription.contains("文本焦点")) }
+        XCTAssertTrue(fixture.copySent)
+        XCTAssertGreaterThanOrEqual(fixture.pauses, 2, "Drain the already posted transaction past the first failed target observation")
+        XCTAssertLessThanOrEqual(fixture.pauses, 40)
+        XCTAssertEqual(fixture.restores, 0)
+        XCTAssertEqual(fixture.clipboard.text, "Late copy after focus loss")
+    }
+
+    @MainActor func testTargetLossAfterPostingWithoutWriteTimesOutAndRestoresEveryOriginalFormat() async {
+        let fixture = SelectionFixture()
+        fixture.storedClipboard.append(["fixture.custom-format": Data([0, 255, 8, 9])])
+        let original = fixture.storedClipboard
+        fixture.onPause = { state in
+            state.currentTarget = nil
+            XCTAssertEqual(state.frontmostPID, 42)
+            XCTAssertEqual(state.restores, 0, "Keep the marker until the posted copy's bounded observation ends")
+        }
+        do {
+            _ = try await SelectionReader.read(copyFallback: true, environment: fixture)
+            XCTFail("An unverifiable target must fail after the bounded no-write observation")
+        } catch { XCTAssertTrue(error.localizedDescription.contains("文本焦点")) }
+        XCTAssertTrue(fixture.copySent)
+        XCTAssertGreaterThan(fixture.pauses, 1)
+        XCTAssertLessThanOrEqual(fixture.pauses, 40)
+        XCTAssertEqual(fixture.restores, 1)
+        XCTAssertEqual(fixture.storedClipboard, original)
+        XCTAssertEqual(fixture.clipboard.text, "Old clipboard")
+    }
+
+    @MainActor func testUnavailableTargetRevalidationRejectsAfterSuccessfulDiscovery() async {
+        let fixture = SelectionFixture(); fixture.ax.text = "Discovered but no longer verifiable"
+        fixture.onTargetCheck = { _, _ in false }
+        do { _ = try await SelectionReader.read(copyFallback: true, environment: fixture); XCTFail("Unavailable later AX validation must fail closed") } catch {}
+        XCTAssertFalse(fixture.copySent); XCTAssertEqual(fixture.snapshots, 0)
+    }
+
+    @MainActor func testUnavailableTargetValidationAfterPostingNeverAcceptsCopiedText() async {
+        let fixture = SelectionFixture()
+        fixture.onTargetCheck = { state, target in !state.copySent && state.currentTarget == target }
+        do { _ = try await SelectionReader.read(copyFallback: true, environment: fixture); XCTFail("A copy cannot be accepted after target validation becomes unavailable") } catch {}
+        XCTAssertTrue(fixture.copySent); XCTAssertEqual(fixture.copiedPIDs, [42])
+        XCTAssertGreaterThanOrEqual(fixture.checkedTargets.count, 2)
+    }
+
+    @MainActor func testClipboardSnapshotFollowsFinalAsyncTargetCheckAndPreservesItsExternalUpdate() async throws {
+        let fixture = SelectionFixture()
+        var expected: ClipboardSnapshot = []
+        fixture.onTargetCheck = { state, target in
+            XCTAssertTrue(state.snapshots == 0 || state.copySent, "No async target check may split snapshot/marker/post")
+            if !state.copySent {
+                await Task.yield()
+                let value = "External clipboard updated during validation \(state.checkedTargets.count)"
+                expected = [["public.utf8-plain-text": Data(value.utf8), "public.rtf": Data([4, 5, 6]),
+                             "fixture.custom-format": Data([0, 255, 7])]]
+                state.storedClipboard = expected
+                state.clipboard = .init(changeCount: state.clipboard.changeCount + 1, text: value)
+            }
+            return state.currentTarget == target
+        }
+        let selected = try await SelectionReader.read(copyFallback: true, environment: fixture)
+        XCTAssertEqual(selected, fixture.copiedText)
+        XCTAssertFalse(expected.isEmpty)
+        XCTAssertEqual(fixture.snapshotContents, [expected])
+        XCTAssertEqual(fixture.storedClipboard, expected, "Restore the external update observed before the probe, including every representation")
+        XCTAssertEqual(fixture.restores, 1)
+        guard let snapshotIndex = fixture.events.firstIndex(of: "snapshot"), let copyIndex = fixture.events.firstIndex(of: "copy") else {
+            return XCTFail("Expected a complete copy transaction")
+        }
+        XCTAssertGreaterThan(snapshotIndex, 0)
+        XCTAssertEqual(fixture.events[snapshotIndex - 1], "target.end")
+        XCTAssertEqual(Array(fixture.events[snapshotIndex...copyIndex]), ["snapshot", "marker", "copy"])
     }
 }

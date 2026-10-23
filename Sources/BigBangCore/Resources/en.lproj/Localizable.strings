@@ -47,6 +47,7 @@
 "无法撤销删除：此预设已存在。" = "Cannot undo deletion: this preset already exists.";
 "无法撤销删除：原快捷键已被其他预设使用，请先更改该快捷键。" = "Cannot undo deletion: another preset uses its original shortcut. Change that shortcut first.";
 "前台应用已改变，请重新选择并触发。" = "The foreground app changed. Select the text and press the shortcut again.";
+"文本焦点已改变，请重新选择并触发。" = "Text focus changed. Select the text and press the shortcut again.";
 "剪切" = "Cut";
 "取消置顶" = "Unpin";
 "响应未正常完成（%@），已保留部分结果。" = "The response did not finish normally (%@). Partial output has been kept.";
