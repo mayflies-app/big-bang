@@ -52,3 +52,14 @@ Tracked-input timestamps are reused only when content hashes, modes and checkout
 ## Homebrew Distribution
 
 The distribution tap is [mayflies-app/homebrew-tap](https://github.com/mayflies-app/homebrew-tap). The release workflow prepares `bigbang` from the verified Universal DMG and updates the tap through the shared release entrypoint. Its URL, version, SHA-256 checksum, bundle name and minimum macOS version must match the published asset.
+
+## Release Diagnostics
+
+Release logs identify stages, failure kinds and external exit codes, with credential-safe
+GitHub error annotations. See [shared release diagnostics](https://github.com/mayflies-app/homebrew-tap/blob/main/docs/homebrew.md#release-diagnostics)
+for authentication, authorization, repository access, network, concurrency and validation errors.
+Tap updates use `HOMEBREW_TAP_TOKEN`, separately from the app workflow token.
+
+A tap failure after successful publication leaves the release assets published. Repair
+the cask from those verified public assets; do not rebuild or replace the same version.
+Only confirmed concurrent push rejection is rebased and retried.
