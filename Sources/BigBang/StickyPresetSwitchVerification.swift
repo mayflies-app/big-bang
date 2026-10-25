@@ -26,7 +26,7 @@ import BigBangSelection
             let independent = StickyWindow(preset: a, source: "independent-note", offset: 1)
             independent.model.output = "Independent output"
             note.configureProcessing(configuration: { configuration }, readKey: {
-                if rejectKey { throw ValidationError("Fixture key unavailable") }
+                if rejectKey { throw ValidationError("请先在设置中保存 API Key。") }
                 return "local-test-key"
             }, start: { sticky, config, key in
                 starts.append(sticky.model.preset.prompt)
@@ -70,13 +70,176 @@ import BigBangSelection
             local["rapidSecondSelectionWins"] = await waitFor { !note.model.running && note.model.output == "B first\nB complete" }
             try? await Task.sleep(for: .milliseconds(550))
             local["rapidCancelledTailCannotPolluteOutput"] = note.model.output == "B first\nB complete" && note.model.preset.id == b.id
+            // A failed switch must be noticeable while reading the start of an
+            // overflowing result, without moving that result to its error footer.
+            note.window?.appearance = NSAppearance(named: mode == .responses ? .aqua : .darkAqua)
+            configuration.presets[1].name = String(repeating: "Long selected preset 🌍 中文 ", count: 10)
+            note.updateConfiguration(configuration)
+            note.model.autoScroll = false
+            let longResult = (1...100).map { "段落 \($0) 🌍 · 保留阅读位置和原始内容。Paragraph \($0) remains available after a failed request." }.joined(separator: "\n\n")
+            note.model.output = longResult
+            local["failedKeyReadLongResultOverflows"] = await waitFor {
+                guard let output = outputView(in: note.hostingView), let scroll = outerScrollView(for: output),
+                      let document = scroll.documentView else { return false }
+                return output.renderingComplete && output.renderedSource == longResult && note.model.contentOverflows &&
+                    document.bounds.height > scroll.contentView.bounds.height + 100
+            }
+            local["failedKeyReadNativeLayoutSettled"] = await settledOutputLayout(note, source: longResult)
+            let failureScroll = outputView(in: note.hostingView).flatMap { outerScrollView(for: $0) }
+            if let scroll = failureScroll {
+                scroll.contentView.scroll(to: NSPoint(x: scroll.documentVisibleRect.minX, y: 0))
+                scroll.reflectScrolledClipView(scroll.contentView)
+            }
+            local["failedKeyReadStartsWithPausedTopReading"] = await waitFor {
+                failureScroll.map { abs($0.documentVisibleRect.minY) < 1 } == true && !note.model.autoScroll
+            }
+            let offsetBeforeFailure = failureScroll?.documentVisibleRect.minY
             rejectKey = true
             let beforeFailure = note.model.output
+            let presetBeforeFailure = note.model.preset
+            let sourceBeforeFailure = note.model.source
+            let followingBeforeFailure = note.model.autoScroll
             let countBeforeFailure = starts.count
             local["failedKeyReadUsesNativeAction"] = select(c.id, in: button)
             local["failedKeyReadPreservesPresetAndOutput"] = note.model.preset.id == b.id && note.model.output == beforeFailure &&
                 !note.model.running && note.model.error != nil && starts.count == countBeforeFailure
             local["failedSelectionRestoresNativeSelection"] = button.selectedItem?.representedObject as? UUID == b.id
+            // Observe the failure before any language fixture repositions the
+            // reader. This barrier measures layout only and never scrolls.
+            local["failedKeyReadLayoutSettlesWithoutFixtureRepositioning"] = await settledOutputLayout(note, source: beforeFailure)
+            let offsetAfterInitialFailure = failureScroll?.documentVisibleRect.minY
+            local["failedKeyReadKeepsReadingBeforeAnyFixtureRepositioning"] = offsetBeforeFailure != nil &&
+                offsetAfterInitialFailure.map { abs($0 - (offsetBeforeFailure ?? 0)) < 1 } == true &&
+                note.model.autoScroll == followingBeforeFailure
+            local["failedKeyReadInitialFailureScreenshotSaved"] = snapshot(note.window,
+                url: reportURL.deletingLastPathComponent().appendingPathComponent("request-failure-\(mode.rawValue)-initial.png"))
+            diagnostics[mode.rawValue + ".failedKeyReadBeforeAnyFixtureRepositioning"] = [
+                "offsetBeforeFailure": offsetBeforeFailure ?? -1,
+                "offsetAfterFailure": offsetAfterInitialFailure ?? -1,
+                "followingBeforeFailure": followingBeforeFailure,
+                "followingAfterFailure": note.model.autoScroll,
+                "rendererRevision": outputView(in: note.hostingView)?.revision ?? -1,
+                "nativeOutputHeight": outputView(in: note.hostingView)?.bounds.height ?? -1,
+                "rendererHeight": outputView(in: note.hostingView)?.contentHeight ?? -1,
+                "documentHeight": failureScroll?.documentView?.bounds.height ?? -1
+            ]
+            for language in AppLanguage.allCases {
+                let prefix = "failedKeyReadFeedback." + language.rawValue + "."
+                let revisionBeforeLanguage = outputView(in: note.hostingView)?.revision ?? -1
+                let languageChanged = note.model.language != language
+                note.setLanguage(to: language)
+                local[prefix + "languageLayoutSettlesBeforePositioning"] = await settledOutputLayout(
+                    note, source: beforeFailure, minimumRevision: revisionBeforeLanguage + (languageChanged ? 1 : 0))
+                // Position only after the new language's settled renderer and
+                // native document have agreed on their geometry. A single scroll
+                // avoids concealing later unintended product movement.
+                if let scroll = failureScroll {
+                    scroll.contentView.scroll(to: NSPoint(x: scroll.documentVisibleRect.minX, y: 0))
+                    scroll.reflectScrolledClipView(scroll.contentView)
+                }
+                let expectedReason = L10n.string("请先在设置中保存 API Key。", language: language)
+                let indicatorReady = await waitFor {
+                    guard let indicator = element(in: note.window, identifier: "sticky.error-state"),
+                          let label = accessibilityLabel(indicator) else { return false }
+                    return label.contains(L10n.string("请求失败", language: language)) && label.contains(expectedReason)
+                }
+                let indicator = element(in: note.window, identifier: "sticky.error-state")
+                let indicatorFrame = indicator.map(frame) ?? .zero
+                let viewportBeforeAction = viewportScreenFrame(note, scroll: failureScroll)
+                let offsetAfterLanguagePositioning = failureScroll?.documentVisibleRect.minY
+                local[prefix + "headerNoticeVisibleWithoutScrolling"] = indicatorReady && hasVisibleArea(indicatorFrame) &&
+                    note.window?.frame.contains(indicatorFrame) == true &&
+                    viewportBeforeAction.map { indicatorFrame.minY >= $0.maxY - 1 } == true
+                local[prefix + "helpIncludesLocalizedReason"] = indicator.flatMap {
+                    accessibilityString($0, attribute: "accessibilityHelp")
+                }?.contains(expectedReason) == true
+                local[prefix + "longTitleAndAllHeaderActionsFit"] = indicator != nil && headerFits(note, button: button)
+                local[prefix + "languageSetupKeepsReadingOffsetAndFollowing"] = offsetBeforeFailure != nil &&
+                    offsetAfterLanguagePositioning.map { abs($0 - (offsetBeforeFailure ?? 0)) < 1 } == true && !note.model.autoScroll
+                local[prefix + "failureKeepsCompleteResultAndRequestState"] = note.model.output == beforeFailure &&
+                    note.model.source == sourceBeforeFailure && note.model.preset == presetBeforeFailure && starts.count == countBeforeFailure
+                local[prefix + "pausedTopScreenshotSaved"] = snapshot(note.window,
+                    url: reportURL.deletingLastPathComponent().appendingPathComponent("request-failure-\(mode.rawValue)-\(language.rawValue)-top.png"))
+
+                // Missing feedback is a direct failure, rather than spending a
+                // second timeout looking for an action absent in the baseline.
+                let pressed = indicator != nil ? await press(in: note.window, identifier: "sticky.error-state") : false
+                let visibleError = pressed ? await waitForVisibleError(in: note, scroll: failureScroll) : false
+                local[prefix + "headerActionShowsCompleteError"] = pressed && visibleError
+                local[prefix + "showingErrorKeepsManualReading"] = pressed && !note.model.autoScroll
+                local[prefix + "followActionRemainsAvailable"] = element(in: note.window, identifier: "sticky.follow-latest").map {
+                    let followFrame = frame($0)
+                    return hasVisibleArea(followFrame) && note.window?.frame.contains(followFrame) == true
+                } == true
+                local[prefix + "errorDetailUsesCurrentLanguage"] = element(in: note.window, identifier: "sticky.error-detail")
+                    .flatMap(staticTextContent)?.contains(expectedReason) == true
+                local[prefix + "showingErrorDoesNotRequestOrReplaceContent"] = pressed && note.model.output == beforeFailure &&
+                    note.model.source == sourceBeforeFailure && note.model.preset == presetBeforeFailure && starts.count == countBeforeFailure
+                local[prefix + "visibleErrorScreenshotSaved"] = snapshot(note.window,
+                    url: reportURL.deletingLastPathComponent().appendingPathComponent("request-failure-\(mode.rawValue)-\(language.rawValue)-detail.png"))
+                let detail = element(in: note.window, identifier: "sticky.error-detail")
+                let follow = element(in: note.window, identifier: "sticky.follow-latest")
+                diagnostics[mode.rawValue + "." + prefix + "geometry"] = [
+                    "windowFrame": note.window.map { NSStringFromRect($0.frame) } ?? "nil",
+                    "indicatorFrame": NSStringFromRect(indicatorFrame),
+                    "indicatorLabel": indicator.flatMap(accessibilityLabel) ?? "nil",
+                    "indicatorHelp": indicator.flatMap { accessibilityString($0, attribute: "accessibilityHelp") } ?? "nil",
+                    "detailFrame": detail.map { NSStringFromRect(frame($0)) } ?? "nil",
+                    "viewportFrame": viewportScreenFrame(note, scroll: failureScroll).map(NSStringFromRect) ?? "nil",
+                    "followButtonFrame": follow.map { NSStringFromRect(frame($0)) } ?? "nil",
+                    "offsetBeforeFailure": offsetBeforeFailure ?? -1,
+                    "offsetAfterLanguagePositioning": offsetAfterLanguagePositioning ?? -1,
+                    "offsetAfterShowingError": failureScroll?.documentVisibleRect.minY ?? -1,
+                    "followingAfterShowingError": note.model.autoScroll,
+                    "revisionBeforeLanguageChange": revisionBeforeLanguage,
+                    "revisionAfterSettling": outputView(in: note.hostingView)?.revision ?? -1,
+                    "nativeOutputHeight": outputView(in: note.hostingView)?.bounds.height ?? -1,
+                    "rendererHeight": outputView(in: note.hostingView)?.contentHeight ?? -1,
+                    "documentHeight": failureScroll?.documentView?.bounds.height ?? -1
+                ]
+            }
+            // These two presentation checks do not start another HTTP request.
+            note.model.autoScroll = true
+            let followsBeforeClick = await waitFor { note.model.autoScroll }
+            let followIndicator = element(in: note.window, identifier: "sticky.error-state")
+            let followingPress = followIndicator != nil ? await press(in: note.window, identifier: "sticky.error-state") : false
+            let followingErrorVisible = followingPress ? await waitForVisibleError(in: note, scroll: failureScroll) : false
+            local["failedKeyReadFeedback.explicitFollowingSurvivesDetailAction"] = followsBeforeClick && followingPress &&
+                followingErrorVisible && note.model.autoScroll
+            local["failedKeyReadFeedback.followingActionDoesNotRequest"] = starts.count == countBeforeFailure &&
+                note.model.output == beforeFailure && note.model.source == sourceBeforeFailure && note.model.preset == presetBeforeFailure
+
+            note.model.running = true
+            local["failedKeyReadFeedback.syntheticRunningHeaderFitsWithSpinner"] = await waitFor {
+                guard let indicator = element(in: note.window, identifier: "sticky.error-state"),
+                      let spinnerFrame = headerSpinnerFrame(in: note),
+                      let window = note.window else { return false }
+                let indicatorFrame = frame(indicator)
+                let neighbors = [frame(button), indicatorFrame] +
+                    ["sticky.copy", "sticky.arrow.uturn.backward", "sticky.stop.fill", "sticky.pin", "sticky.xmark"].compactMap {
+                        element(in: window, identifier: $0).map(frame)
+                    }
+                return note.model.running && hasVisibleArea(spinnerFrame) && window.frame.contains(spinnerFrame) &&
+                    headerFits(note, button: button) && neighbors.allSatisfy { !hasVisibleArea(spinnerFrame.intersection($0)) }
+            }
+            note.model.autoScroll = false
+            local["failedKeyReadFeedback.syntheticRunningKeepsPausedFollowAction"] = await waitFor {
+                guard let follow = element(in: note.window, identifier: "sticky.follow-latest") else { return false }
+                return !note.model.autoScroll && hasVisibleArea(frame(follow)) && note.window?.frame.contains(frame(follow)) == true
+            }
+            local["failedKeyReadFeedback.syntheticRunningScreenshotSaved"] = snapshot(note.window,
+                url: reportURL.deletingLastPathComponent().appendingPathComponent("request-failure-\(mode.rawValue)-running.png"))
+            local["failedKeyReadFeedback.syntheticRunningDoesNotRequestOrReplaceContent"] = starts.count == countBeforeFailure &&
+                note.model.output == beforeFailure && note.model.source == sourceBeforeFailure && note.model.preset == presetBeforeFailure
+            diagnostics[mode.rawValue + ".failedKeyReadFeedback.syntheticRunning"] = [
+                "spinnerFrame": headerSpinnerFrame(in: note).map(NSStringFromRect) ?? "nil",
+                "headerNativeViews": headerNativeViewDiagnostics(in: note),
+                "indicatorFrame": element(in: note.window, identifier: "sticky.error-state").map { NSStringFromRect(frame($0)) } ?? "nil",
+                "following": note.model.autoScroll,
+                "requestCount": starts.count,
+                "requestCountBeforeFailure": countBeforeFailure
+            ]
+            note.model.running = false
             rejectKey = false
             // Exercise a stale menu item whose ID has vanished from the live configuration.
             let staleID = UUID()
@@ -102,9 +265,13 @@ import BigBangSelection
             local["configurationUpdateDoesNotRequest"] = starts.count == countBeforeFailure
             local["configurationUpdatesLanguage"] = note.model.language == .english
             local["retryAfterPromptEditUsesNativeControl"] = await press(in: note.window, identifier: "sticky.arrow.clockwise")
+            local["retryStartClearsErrorNotice"] = await waitFor {
+                note.model.running && note.model.error == nil && element(in: note.window, identifier: "sticky.error-state") == nil
+            }
             local["retryUsesLatestPromptForSelectedIdentity"] = await waitFor {
                 !note.model.running && note.model.output == "C first\nC complete" && note.model.preset.id == b.id && note.model.preset.prompt == "fixture-preset-C"
             }
+            local["retrySuccessKeepsErrorNoticeHidden"] = note.model.error == nil && element(in: note.window, identifier: "sticky.error-state") == nil
             configuration.presets = [longC, a]
             note.updateConfiguration(configuration)
             local["deletionRemovesPresetFromAvailableList"] = note.model.availablePresets.map(\.id) == [c.id, a.id]
@@ -257,6 +424,109 @@ import BigBangSelection
         if let button = view as? NSPopUpButton, button.accessibilityIdentifier() == "sticky.preset" { return button }
         return view.subviews.lazy.compactMap { popup(in: $0) }.first
     }
+    private static func outputView(in view: NSView) -> StickyTextView? {
+        if let output = view as? StickyTextView { return output }
+        return view.subviews.lazy.compactMap { outputView(in: $0) }.first
+    }
+    private static func settledOutputLayout(_ note: StickyWindow, source: String, minimumRevision: Int = -1) async -> Bool {
+        var previous: [CGFloat]?
+        var stableSamples = 0
+        for _ in 0..<150 {
+            if let output = outputView(in: note.hostingView), let scroll = outerScrollView(for: output),
+               let document = scroll.documentView, output.revision >= minimumRevision,
+               output.renderingComplete, output.renderedSource == source,
+               output.readingPosition(following: false) != nil,
+               abs(output.bounds.height - output.contentHeight) <= 1,
+               abs(output.bounds.width - output.contentWidth) <= 1,
+               document.bounds.height >= output.contentHeight {
+                let sample = [CGFloat(output.revision), output.bounds.width, output.bounds.height,
+                              document.bounds.width, document.bounds.height,
+                              scroll.contentView.bounds.width, scroll.contentView.bounds.height]
+                stableSamples = previous == sample ? stableSamples + 1 : 1
+                previous = sample
+                if stableSamples >= 3 { return true }
+            } else {
+                previous = nil
+                stableSamples = 0
+            }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        return false
+    }
+    private static func accessibilityElement(in root: Any?, role: String) -> NSObject? {
+        guard let object = root as? NSObject else { return nil }
+        if accessibilityString(object, attribute: "accessibilityRole") == role { return object }
+        let children = NSSelectorFromString("accessibilityChildren")
+        guard object.responds(to: children), let items = object.perform(children)?.takeUnretainedValue() as? [Any] else { return nil }
+        return items.lazy.compactMap { accessibilityElement(in: $0, role: role) }.first
+    }
+    private static func nativeProgressIndicator(in root: NSView, window: NSWindow) -> NSProgressIndicator? {
+        if let spinner = root as? NSProgressIndicator, !spinner.isHiddenOrHasHiddenAncestor,
+           spinner.window === window {
+            let visibleFrame = window.convertToScreen(spinner.convert(spinner.bounds, to: nil))
+            let header = NSRect(x: window.frame.minX, y: window.frame.maxY - StickyView.headerHeight,
+                                width: window.frame.width, height: StickyView.headerHeight)
+            if hasVisibleArea(visibleFrame), header.contains(visibleFrame) { return spinner }
+        }
+        return root.subviews.lazy.compactMap { nativeProgressIndicator(in: $0, window: window) }.first
+    }
+    private static func headerSpinnerFrame(in note: StickyWindow) -> NSRect? {
+        guard let window = note.window else { return nil }
+        // SwiftUI can render a native spinner without exposing an AX progress
+        // role. Measure that actual view in the same screen coordinates as AX.
+        if let spinner = nativeProgressIndicator(in: note.hostingView, window: window) {
+            return window.convertToScreen(spinner.convert(spinner.bounds, to: nil))
+        }
+        guard let spinner = accessibilityElement(in: window, role: NSAccessibility.Role.progressIndicator.rawValue) else { return nil }
+        let spinnerFrame = frame(spinner)
+        let header = NSRect(x: window.frame.minX, y: window.frame.maxY - StickyView.headerHeight,
+                            width: window.frame.width, height: StickyView.headerHeight)
+        return hasVisibleArea(spinnerFrame) && header.contains(spinnerFrame) ? spinnerFrame : nil
+    }
+    private static func headerNativeViewDiagnostics(in note: StickyWindow) -> [[String: String]] {
+        guard let window = note.window else { return [] }
+        let header = NSRect(x: window.frame.minX, y: window.frame.maxY - StickyView.headerHeight,
+                            width: window.frame.width, height: StickyView.headerHeight)
+        func entries(in view: NSView) -> [[String: String]] {
+            let rectangle = window.convertToScreen(view.convert(view.bounds, to: nil))
+            let own: [[String: String]] = !view.isHiddenOrHasHiddenAncestor && hasVisibleArea(rectangle) && header.contains(rectangle) ? [
+                ["class": String(String(describing: type(of: view)).prefix(120)), "frame": NSStringFromRect(rectangle),
+                 "role": accessibilityString(view, attribute: "accessibilityRole") ?? "nil"]
+            ] : []
+            return own + view.subviews.flatMap { entries(in: $0) }
+        }
+        return Array(entries(in: note.hostingView).prefix(24))
+    }
+    private static func outerScrollView(for view: NSView) -> NSScrollView? {
+        var ancestor = view.superview
+        while let current = ancestor {
+            if let scroll = current as? NSScrollView { return scroll }
+            ancestor = current.superview
+        }
+        return nil
+    }
+    private static func hasVisibleArea(_ rectangle: NSRect) -> Bool {
+        rectangle.width > 1 && rectangle.height > 1 &&
+            rectangle.origin.x.isFinite && rectangle.origin.y.isFinite && rectangle.width.isFinite && rectangle.height.isFinite
+    }
+    private static func viewportScreenFrame(_ note: StickyWindow, scroll: NSScrollView?) -> NSRect? {
+        guard let window = note.window, let scroll else { return nil }
+        return window.convertToScreen(scroll.contentView.convert(scroll.contentView.bounds, to: nil))
+    }
+    private static func waitForVisibleError(in note: StickyWindow, scroll: NSScrollView?) async -> Bool {
+        await waitFor {
+            guard let detail = element(in: note.window, identifier: "sticky.error-detail"),
+                  let viewport = viewportScreenFrame(note, scroll: scroll), let window = note.window else { return false }
+            let detailFrame = frame(detail)
+            guard hasVisibleArea(detailFrame), hasVisibleArea(viewport), viewport.contains(detailFrame),
+                  window.frame.contains(detailFrame) else { return false }
+            if let follow = element(in: window, identifier: "sticky.follow-latest") {
+                let overlap = detailFrame.intersection(frame(follow))
+                if hasVisibleArea(overlap) { return false }
+            }
+            return true
+        }
+    }
     private static func menuIDs(_ button: NSPopUpButton) -> [UUID] {
         button.menu?.items.compactMap { $0.representedObject as? UUID } ?? []
     }
@@ -294,7 +564,12 @@ import BigBangSelection
         let actions = ["sticky.copy", "sticky.arrow.uturn.backward", note.model.running ? "sticky.stop.fill" : "sticky.arrow.clockwise", "sticky.pin", "sticky.xmark"].compactMap {
             element(in: window, identifier: $0).map(frame)
         }
-        return selectorFrame.width > 30 && selectorFrame.height > 15 && actions.count == 5 && actions.allSatisfy {
+        let error = element(in: window, identifier: "sticky.error-state").map(frame)
+        let errorFits = error.map { errorFrame in
+            hasVisibleArea(errorFrame) && window.frame.contains(errorFrame) && selectorFrame.maxX <= errorFrame.minX + 1 &&
+                actions.allSatisfy { errorFrame.maxX <= $0.minX + 1 }
+        } ?? true
+        return errorFits && selectorFrame.width > 30 && selectorFrame.height > 15 && actions.count == 5 && actions.allSatisfy {
             $0.width >= 30 && $0.height >= 30 && window.frame.contains($0) && selectorFrame.maxX <= $0.minX + 1
         }
     }

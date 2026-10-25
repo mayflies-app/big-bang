@@ -133,6 +133,7 @@ struct StickyView: View {
     @Environment(\.colorScheme) private var colorScheme
     @State private var copied = false
     @State private var copyFeedback: Task<Void, Never>?
+    @State private var errorRevealRequest = UUID()
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 3) {
@@ -148,6 +149,19 @@ struct StickyView: View {
                         .lineLimit(1).fixedSize().padding(.leading, 5)
                         .accessibilityLabel(model.displayedState)
                         .accessibilityIdentifier("sticky.stopped-state")
+                }
+                if let error = model.displayedError {
+                    Button { errorRevealRequest = UUID() } label: {
+                        Image(systemName: "exclamationmark.circle.fill")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(Color(nsColor: .systemRed))
+                            .frame(width: MacAppDesignTokens.symbolButtonExtent, height: MacAppDesignTokens.symbolButtonExtent)
+                            .contentShape(RoundedRectangle(cornerRadius: MacAppDesignTokens.controlRadius))
+                    }
+                    .buttonStyle(StickyActionStyle(selected: false))
+                    .help(error)
+                    .accessibilityLabel("\(L10n.string("请求失败", language: model.language)): \(error)")
+                    .accessibilityIdentifier("sticky.error-state")
                 }
                 Spacer(minLength: 4)
                 icon(copied ? "checkmark" : "doc.on.doc", help: copied ? "已复制" : "复制") {
@@ -200,8 +214,11 @@ struct StickyView: View {
                                 .textSelection(.enabled)
                                 .padding(10).frame(maxWidth: .infinity, alignment: .leading)
                                 .background(.red.opacity(0.06), in: RoundedRectangle(cornerRadius: MacAppDesignTokens.controlRadius))
+                                .accessibilityIdentifier("sticky.error-detail")
+                                .id("error")
                         }
-                        Color.clear.frame(height: 1).id("end")
+                        // Leave the error readable above the floating follow button.
+                        Color.clear.frame(height: model.error == nil ? 1 : 44).id("end")
                     }.padding(.horizontal, 18).padding(.bottom, 18).padding(.top, 12)
                         .onGeometryChange(for: CGFloat.self, of: { $0.size.height }) { model.contentHeightChanged?($0) }
                 }
@@ -219,6 +236,12 @@ struct StickyView: View {
                 .onChange(of: model.running) { _, running in if running { model.autoScroll = true } }
                 .onChange(of: model.output) { _, _ in
                     if model.autoScroll && model.contentOverflows { proxy.scrollTo("end", anchor: .bottom) }
+                }
+                .onChange(of: errorRevealRequest) { _, _ in
+                    guard model.error != nil else { return }
+                    // Explicit navigation must not change the reader's follow setting.
+                    model.preserveRestoredFollowing = true
+                    proxy.scrollTo("error", anchor: .top)
                 }
                 .overlay(alignment: .bottom) {
                     if model.contentOverflows && !model.autoScroll && !model.awaitingInput && !model.output.isEmpty {
@@ -419,7 +442,7 @@ private struct OutputFollowing: ViewModifier {
                         // Growing output must not be mistaken for scrolling away from the bottom.
                         if follow { scrollToEnd() }
                     } else if preserveRestoredFollowing {
-                        // Restoring a paused result at the bottom is not a reader scroll.
+                        // Restoring reading state or revealing an error is not a reader scroll.
                         return
                     } else if new.visibleBottom >= new.height - 24 {
                         follow = true
