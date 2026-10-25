@@ -25,6 +25,8 @@ import Combine
     private var suppressDraftSave = false
     private var savingPresetTransaction = false
     private var deletedPresetIndex: Int?
+    /// Only this exact, unedited default may be replaced when undoing the pending deletion.
+    private var restoredDeletedPreset: Preset?
 
     public init(configuration: Configuration, hasKey: Bool = false, saveDelay: Duration = .milliseconds(300),
                 save: @escaping (Configuration, String) throws -> Void, deleteKey: @escaping () throws -> Void) {
@@ -80,6 +82,7 @@ import Combine
         var candidate = draft
         let deleted = candidate.presets.remove(at: index)
         guard persistPresetTransaction(candidate) else { return false }
+        restoredDeletedPreset = nil
         deletedPresetIndex = index
         lastDeletedPreset = deleted
         return true
@@ -87,15 +90,18 @@ import Combine
     /// Restores the last deletion without replacing later edits or remapping its original shortcut.
     @discardableResult public func undoDeletePreset() -> UUID? {
         guard let preset = lastDeletedPreset, let index = deletedPresetIndex else { return nil }
-        guard !draft.presets.contains(where: { $0.id == preset.id }) else {
-            error = L10n.string("无法撤销删除：此预设已存在。", language: draft.language)
-            return nil
+        var candidate = draft
+        if let existingIndex = candidate.presets.firstIndex(where: { $0.id == preset.id }) {
+            guard let restoredDeletedPreset, candidate.presets[existingIndex] == restoredDeletedPreset else {
+                error = L10n.string("无法撤销删除：此预设已存在。", language: draft.language)
+                return nil
+            }
+            candidate.presets.remove(at: existingIndex)
         }
-        guard !draft.presets.contains(where: { $0.shortcut.identity == preset.shortcut.identity }) else {
+        guard !candidate.presets.contains(where: { $0.shortcut.identity == preset.shortcut.identity }) else {
             error = L10n.string("无法撤销删除：原快捷键已被其他预设使用，请先更改该快捷键。", language: draft.language)
             return nil
         }
-        var candidate = draft
         candidate.presets.insert(preset, at: min(index, candidate.presets.count))
         guard persistPresetTransaction(candidate) else { return nil }
         dismissDeletedPreset()
@@ -104,6 +110,7 @@ import Combine
     public func dismissDeletedPreset() {
         lastDeletedPreset = nil
         deletedPresetIndex = nil
+        restoredDeletedPreset = nil
     }
     private func persistPresetTransaction(_ candidate: Configuration) -> Bool {
         do { try candidate.validate() } catch { self.error = error.localizedDescription; return false }
@@ -114,7 +121,10 @@ import Combine
             if !pendingKey.isEmpty && pendingKey != savedKeyInput { scheduleSave() }
         }
         savingPresetTransaction = true
+        suppressDraftSave = true
         draft = candidate
+        suppressDraftSave = false
+        flush() // Content-only replacements also require one synchronous, rollback-capable save.
         savingPresetTransaction = false
         guard error == nil else {
             suppressDraftSave = true; draft = previousDraft; suppressDraftSave = false
@@ -166,6 +176,7 @@ import Combine
     @discardableResult public func restoreDefaultPresets() -> [UUID] {
         var candidate = draft
         var added: [UUID] = []
+        var restoredPendingDeletion: Preset?
         var occupied = Set(candidate.presets.map { $0.shortcut.identity })
         for var preset in Preset.defaults(for: candidate.language) {
             guard !candidate.presets.contains(where: { $0.builtIn == preset.builtIn || $0.id == preset.id }) else { continue }
@@ -178,9 +189,12 @@ import Combine
             }
             occupied.insert(preset.shortcut.identity)
             candidate.presets.append(preset); added.append(preset.id)
+            if preset.id == lastDeletedPreset?.id { restoredPendingDeletion = preset }
         }
         guard !added.isEmpty else { return [] }
-        return persistPresetTransaction(candidate) ? added : []
+        guard persistPresetTransaction(candidate) else { return [] }
+        if let restoredPendingDeletion { restoredDeletedPreset = restoredPendingDeletion }
+        return added
     }
     /// Moves an existing preset by one place and persists the complete order atomically.
     @discardableResult public func movePreset(id: UUID, by distance: Int) -> Bool {

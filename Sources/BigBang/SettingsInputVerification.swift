@@ -453,6 +453,130 @@ import BigBangCore
             editor.flush()
             window.makeFirstResponder(window)
             await pause(120)
+            await presetRestoreThenUndoRecovery()
+        }
+
+        func presetRestoreThenUndoRecovery() async {
+            let original = editor.draft
+            guard let originalIndex = original.presets.firstIndex(where: { $0.builtIn == .summarize }) else {
+                checks["restoreThenUndo.builtInFixtureAvailable"] = false
+                return
+            }
+            for language in AppLanguage.allCases {
+                let prefix = "restoreThenUndo." + language.rawValue + "."
+                window.makeFirstResponder(window)
+                editor.dismissDeletedPreset()
+                var customized = original
+                customized.language = language
+                customized.presets[originalIndex].name = "保留自定义 \(language.rawValue) 🙂"
+                customized.presets[originalIndex].prompt = "用户第一行 🌍\n第二行：撤销恢复原指令，保留完整空白。  "
+                customized.presets[originalIndex].shortcut = .init(keyCode: 40, modifiers: 6400, label: "⌃⌥⌘K")
+                let deleted = customized.presets[originalIndex]
+                editor.draft = customized
+                editor.flush()
+                _ = element("settings.section.presets")?.press()
+                await pause(120)
+
+                let deletePressed = element("settings.preset.\(deleted.id).delete")?.press() == true
+                await pause(120)
+                checks[prefix + "nativeDeletePersistsCustomizedSnapshot"] = deletePressed &&
+                    editor.lastDeletedPreset == deleted && !persisted.presets.contains(where: { $0.id == deleted.id }) &&
+                    element("settings.preset.undoDelete") != nil
+                let restorePressed = element("settings.preset.restore")?.press() == true
+                await pause(160)
+                let factory = Preset.defaults(for: language).first(where: { $0.id == deleted.id })
+                checks[prefix + "nativeRestoreAddsFactoryIdentityAndKeepsUndo"] = restorePressed && factory != nil &&
+                    editor.draft.presets.filter { $0.id == deleted.id } == factory.map { [$0] } &&
+                    persisted == editor.draft && editor.lastDeletedPreset == deleted && element("settings.preset.undoDelete") != nil
+                checks[prefix + "factoryReplacementPreviewSaved"] = snapshot("preset-restored-before-undo-\(language.rawValue).png")
+
+                // A native edit made after restoration must survive replacing the
+                // untouched factory row with the user's deleted snapshot.
+                let otherID = customized.presets[0].id
+                let otherPromptID = "settings.preset.\(otherID).prompt"
+                let laterText = customized.presets[0].prompt + "\nLater edit \(language.rawValue) stays."
+                let otherEditor = try? await focus(otherPromptID)
+                otherEditor?.insertText(laterText, replacementRange: NSRange(location: 0, length: otherEditor?.string.utf16.count ?? 0))
+                await pause(420)
+                checks[prefix + "laterNativeEditPersistsBeforeUndo"] = otherEditor != nil &&
+                    persisted.presets.first(where: { $0.id == otherID })?.prompt == laterText
+                var expected = editor.draft
+                expected.presets.removeAll { $0.id == deleted.id }
+                expected.presets.insert(deleted, at: min(originalIndex, expected.presets.count))
+                let restoredNameID = "settings.preset.\(deleted.id).name"
+                let scroll = (try? nativeTarget("settings.preset.\(otherID).name"))?.view.enclosingScrollView
+                // Preserve the actual position left by native editing. Successful
+                // Undo must end with the restored name visibly editable; its
+                // navigation distance is not part of the product contract.
+                let targetFrameBeforeUndo = element(restoredNameID)?.frame ?? .zero
+                let viewportBeforeUndo = scroll.map {
+                    window.convertToScreen($0.contentView.convert($0.contentView.bounds, to: nil))
+                } ?? .zero
+                let offsetBeforeUndo = scroll?.contentView.bounds.minY
+                let documentBoundsBeforeUndo = scroll?.documentView?.bounds ?? .zero
+                let clipBoundsBeforeUndo = scroll?.contentView.bounds ?? .zero
+                let documentIsFlipped = scroll?.documentView?.isFlipped ?? false
+                checks[prefix + "nativeUndoContextPreviewSaved"] = snapshot("preset-restored-undo-context-\(language.rawValue).png")
+                let undoPressed = element("settings.preset.undoDelete")?.press() == true
+                var restoredFrame = NSRect.zero
+                var restoredViewport = NSRect.zero
+                var offsetAfterUndo: CGFloat?
+                var previousSample: [CGFloat]?
+                var stableSamples = 0
+                var revealReady = false
+                for _ in 0..<100 {
+                    restoredFrame = element(restoredNameID)?.frame ?? .zero
+                    restoredViewport = .zero
+                    offsetAfterUndo = nil
+                    let restoredScroll = (try? nativeTarget(restoredNameID))?.view.enclosingScrollView
+                    if let restoredScroll {
+                        restoredViewport = window.convertToScreen(restoredScroll.contentView.convert(restoredScroll.contentView.bounds, to: nil))
+                        offsetAfterUndo = restoredScroll.contentView.bounds.minY
+                    }
+                    if restoredFrame.width > 1, restoredFrame.height > 1,
+                       restoredViewport.width > 1, restoredViewport.height > 1,
+                       restoredViewport.contains(restoredFrame), window.frame.contains(restoredFrame),
+                       (try? focusedEditor(restoredNameID))?.string == deleted.name, let offsetAfterUndo {
+                        let sample = [restoredFrame.minX, restoredFrame.minY, restoredFrame.width, restoredFrame.height,
+                                      restoredViewport.minX, restoredViewport.minY, restoredViewport.width, restoredViewport.height, offsetAfterUndo]
+                        stableSamples = previousSample == sample ? stableSamples + 1 : 1
+                        previousSample = sample
+                        if stableSamples >= 3 { revealReady = true; break }
+                    } else {
+                        previousSample = nil
+                        stableSamples = 0
+                    }
+                    await pause(20)
+                }
+                let roundTrip = try? JSONDecoder().decode(Configuration.self, from: JSONEncoder().encode(persisted))
+                checks[prefix + "nativeUndoRestoresCompleteCustomPresetAndOriginalOrder"] = undoPressed &&
+                    editor.draft == expected && persisted == expected && roundTrip == expected && editor.error == nil &&
+                    editor.draft.presets[originalIndex] == deleted
+                checks[prefix + "nativeUndoPreservesLaterEdit"] = undoPressed &&
+                    persisted.presets.first(where: { $0.id == otherID })?.prompt == laterText
+                checks[prefix + "successfulUndoRemovesNotice"] = undoPressed && editor.lastDeletedPreset == nil &&
+                    element("settings.preset.deleted.notice") == nil && element("settings.preset.undoDelete") == nil
+                checks[prefix + "undoRevealsRestoredNameAndTransfersNativeFocus"] = undoPressed && revealReady
+                checks[prefix + "restoredCustomPreviewSaved"] = snapshot("preset-restored-custom-after-undo-\(language.rawValue).png")
+                observations.append(["phase": prefix + "nativeRecovery", "deletePressed": deletePressed,
+                    "restorePressed": restorePressed, "undoPressed": undoPressed, "deletedID": deleted.id.uuidString,
+                    "originalIndex": originalIndex, "actualIndex": editor.draft.presets.firstIndex(where: { $0.id == deleted.id }) ?? -1,
+                    "completeCustomRestored": persisted.presets.contains(deleted), "error": editor.error ?? "",
+                    "restoredNameFrame": NSStringFromRect(restoredFrame), "offsetBeforeUndo": offsetBeforeUndo ?? -1,
+                    "offsetAfterUndo": offsetAfterUndo ?? -1, "saveCount": saves.count,
+                    "revealReady": revealReady, "stableSamples": stableSamples,
+                    "documentIsFlipped": documentIsFlipped,
+                    "documentBoundsBeforeUndo": NSStringFromRect(documentBoundsBeforeUndo),
+                    "clipBoundsBeforeUndo": NSStringFromRect(clipBoundsBeforeUndo),
+                    "targetNameFrameBeforeUndo": NSStringFromRect(targetFrameBeforeUndo),
+                    "viewportScreenFrameBeforeUndo": NSStringFromRect(viewportBeforeUndo),
+                    "viewportScreenFrameAfterUndo": NSStringFromRect(restoredViewport)])
+            }
+            window.makeFirstResponder(window)
+            editor.dismissDeletedPreset()
+            editor.draft = original
+            editor.flush()
+            await pause(120)
         }
 
         func repeatedPresetAddition() async {

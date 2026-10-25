@@ -19,6 +19,228 @@ import XCTest
 }
 
 final class PresetTransactionTests: XCTestCase {
+    @MainActor func testUndoAfterRestoringDefaultsRecoversCustomizedBuiltInAndPreservesLaterChanges() throws {
+        var configuration = Configuration(language: .simplifiedChinese)
+        configuration.presets[2].name = "Custom 名称"; configuration.presets[2].prompt = "Custom prompt\n用户内容"
+        configuration.presets[2].shortcut = .init(keyCode: 29, modifiers: 6656, label: "⌃⌥⇧0")
+        let deleted = configuration.presets[2]
+        let sink = PresetTransactionSink(configuration); let form = sink.editor()
+        XCTAssertTrue(form.deletePreset(id: deleted.id))
+        XCTAssertEqual(form.restoreDefaultPresets(), [deleted.id])
+        XCTAssertEqual(form.draft.presets.last, Preset.defaults[2])
+        XCTAssertTrue(form.restoreDefaultPresets().isEmpty)
+        form.draft.presets[0].prompt = "Later edit"
+        form.draft.model = "later-model"
+        let addedID = try XCTUnwrap(form.addPreset())
+        var expected = form.draft
+        expected.presets.removeAll { $0.id == deleted.id }
+        expected.presets.insert(deleted, at: 2)
+        XCTAssertEqual(form.undoDeletePreset(), deleted.id)
+        XCTAssertEqual(form.draft, expected)
+        XCTAssertEqual(sink.configuration, expected)
+        XCTAssertEqual(form.draft.presets.last?.id, addedID)
+        XCTAssertNil(form.lastDeletedPreset)
+        let reopened = try JSONDecoder().decode(Configuration.self, from: JSONEncoder().encode(sink.configuration))
+        XCTAssertEqual(reopened, expected)
+    }
+
+    @MainActor func testUndoRecognizesRestoredDefaultWithFallbackShortcutAndRestoresCustomShortcut() throws {
+        var configuration = Configuration(language: .simplifiedChinese)
+        configuration.presets[2].name = "Custom"; configuration.presets[2].prompt = "Custom instructions"
+        configuration.presets[2].shortcut = .init(keyCode: 29, modifiers: 6656, label: "⌃⌥⇧0")
+        let occupant = Preset(name: "Uses default shortcut", prompt: "Preserve me", shortcut: Preset.defaults[2].shortcut)
+        configuration.presets.append(occupant)
+        let deleted = configuration.presets[2]
+        let sink = PresetTransactionSink(configuration); let form = sink.editor()
+        XCTAssertTrue(form.deletePreset(id: deleted.id))
+        XCTAssertEqual(form.restoreDefaultPresets(), [deleted.id])
+        let restored = try XCTUnwrap(form.draft.presets.first { $0.id == deleted.id })
+        XCTAssertEqual(restored.shortcut.label, "⌃⌥6")
+        XCTAssertNotEqual(restored.shortcut.identity, deleted.shortcut.identity)
+        XCTAssertEqual(form.undoDeletePreset(), deleted.id)
+        XCTAssertEqual(form.draft, configuration)
+        XCTAssertEqual(sink.configuration, configuration)
+        XCTAssertEqual(form.draft.presets.last, occupant)
+    }
+
+    @MainActor func testUndoRefusesEditedRestoredDefaultWithoutOverwritingAnyField() throws {
+        for editedField in ["name", "prompt", "shortcut", "builtIn"] {
+            var configuration = Configuration(language: .simplifiedChinese)
+            configuration.presets[1].name = "Deleted custom name"
+            let deleted = configuration.presets[1]
+            let sink = PresetTransactionSink(configuration); let form = sink.editor()
+            XCTAssertTrue(form.deletePreset(id: deleted.id))
+            XCTAssertEqual(form.restoreDefaultPresets(), [deleted.id])
+            let index = try XCTUnwrap(form.draft.presets.firstIndex { $0.id == deleted.id })
+            switch editedField {
+            case "name": form.draft.presets[index].name = "Edited restored name"
+            case "prompt": form.draft.presets[index].prompt = "Edited restored prompt"
+            case "shortcut": form.draft.presets[index].shortcut = .init(keyCode: 29, modifiers: 6656, label: "⌃⌥⇧0")
+            default: form.draft.presets[index].builtIn = nil
+            }
+            form.flush()
+            let beforeUndo = form.draft; let writes = sink.writes
+            XCTAssertNil(form.undoDeletePreset(), editedField)
+            XCTAssertEqual(form.draft, beforeUndo, editedField)
+            XCTAssertEqual(sink.configuration, beforeUndo, editedField)
+            XCTAssertEqual(sink.writes, writes, editedField)
+            XCTAssertEqual(form.lastDeletedPreset, deleted, editedField)
+            XCTAssertEqual(form.error, "无法撤销删除：此预设已存在。", editedField)
+        }
+    }
+
+    @MainActor func testUndoRefusesDefaultInsertedOutsideRestoreEvenWhenContentsMatch() {
+        var configuration = Configuration(language: .simplifiedChinese)
+        configuration.presets[1].name = "Deleted custom name"
+        let deleted = configuration.presets[1]
+        let sink = PresetTransactionSink(configuration); let form = sink.editor()
+        XCTAssertTrue(form.deletePreset(id: deleted.id))
+        form.draft.presets.append(Preset.defaults[1])
+        let beforeUndo = form.draft; let writes = sink.writes
+        XCTAssertNil(form.undoDeletePreset())
+        XCTAssertEqual(form.draft, beforeUndo)
+        XCTAssertEqual(sink.writes, writes)
+        XCTAssertEqual(form.lastDeletedPreset, deleted)
+        XCTAssertEqual(form.error, "无法撤销删除：此预设已存在。")
+    }
+
+    @MainActor func testUndoAfterRestoreChecksOriginalShortcutConflictAndCanRetry() {
+        var configuration = Configuration(language: .simplifiedChinese)
+        configuration.presets[1].name = "Deleted custom name"
+        configuration.presets[1].shortcut = .init(keyCode: 29, modifiers: 6656, label: "⌃⌥⇧0")
+        let deleted = configuration.presets[1]
+        let sink = PresetTransactionSink(configuration); let form = sink.editor()
+        XCTAssertTrue(form.deletePreset(id: deleted.id))
+        XCTAssertEqual(form.restoreDefaultPresets(), [deleted.id])
+        let previousShortcut = form.draft.presets[0].shortcut
+        form.draft.presets[0].shortcut = deleted.shortcut
+        let beforeUndo = form.draft; let writes = sink.writes
+        XCTAssertNil(form.undoDeletePreset())
+        XCTAssertEqual(form.error, "无法撤销删除：原快捷键已被其他预设使用，请先更改该快捷键。")
+        XCTAssertEqual(form.draft, beforeUndo)
+        XCTAssertEqual(sink.writes, writes)
+        XCTAssertEqual(form.lastDeletedPreset, deleted)
+        form.draft.presets[0].shortcut = previousShortcut
+        XCTAssertEqual(form.undoDeletePreset(), deleted.id)
+        XCTAssertEqual(form.draft, configuration)
+    }
+
+    @MainActor func testFailedUndoAfterRestoreRollsBackReplacementAndRetainsSnapshotForRetry() {
+        var configuration = Configuration(language: .simplifiedChinese)
+        configuration.presets[1].name = "Deleted custom name"
+        let deleted = configuration.presets[1]
+        let sink = PresetTransactionSink(configuration); let form = sink.editor()
+        XCTAssertTrue(form.deletePreset(id: deleted.id))
+        XCTAssertEqual(form.restoreDefaultPresets(), [deleted.id])
+        let beforeUndo = form.draft; let writes = sink.writes
+        sink.fail = true
+        XCTAssertNil(form.undoDeletePreset())
+        XCTAssertEqual(form.error, "保存失败")
+        XCTAssertEqual(form.draft, beforeUndo)
+        XCTAssertEqual(sink.configuration, beforeUndo)
+        XCTAssertEqual(sink.writes, writes)
+        XCTAssertEqual(form.lastDeletedPreset, deleted)
+        sink.fail = false
+        XCTAssertEqual(form.undoDeletePreset(), deleted.id)
+        XCTAssertEqual(sink.writes, writes + 1)
+        XCTAssertEqual(form.draft, configuration)
+        XCTAssertNil(form.lastDeletedPreset)
+    }
+
+    @MainActor func testUndoOfRestoredLastPresetPersistsContentReplacementSynchronouslyAndRollsBackOnFailure() {
+        var configuration = Configuration(language: .simplifiedChinese)
+        let lastIndex = configuration.presets.count - 1
+        configuration.presets[lastIndex].name = "Last customized name"
+        configuration.presets[lastIndex].prompt = "Last customized prompt"
+        let deleted = configuration.presets[lastIndex]
+        let sink = PresetTransactionSink(configuration); let form = sink.editor()
+        XCTAssertTrue(form.deletePreset(id: deleted.id))
+        XCTAssertEqual(form.restoreDefaultPresets(), [deleted.id])
+        let beforeUndo = form.draft; let writes = sink.writes
+        XCTAssertEqual(beforeUndo.presets.map(\.id), configuration.presets.map(\.id))
+        XCTAssertEqual(beforeUndo.presets.map(\.shortcut), configuration.presets.map(\.shortcut))
+        sink.fail = true
+        XCTAssertNil(form.undoDeletePreset())
+        XCTAssertEqual(form.error, "保存失败")
+        XCTAssertEqual(form.draft, beforeUndo)
+        XCTAssertEqual(sink.configuration, beforeUndo)
+        XCTAssertEqual(sink.writes, writes)
+        XCTAssertEqual(form.lastDeletedPreset, deleted)
+        sink.fail = false
+        XCTAssertEqual(form.undoDeletePreset(), deleted.id)
+        XCTAssertEqual(form.draft, configuration)
+        XCTAssertEqual(sink.configuration, configuration)
+        XCTAssertEqual(sink.writes, writes + 1)
+        XCTAssertNil(form.lastDeletedPreset)
+    }
+
+    @MainActor func testFailedRestoreDoesNotAuthorizeReplacingDefaultInsertedElsewhere() {
+        var configuration = Configuration(language: .simplifiedChinese)
+        configuration.presets[1].name = "Deleted custom name"
+        let deleted = configuration.presets[1]
+        let sink = PresetTransactionSink(configuration); let form = sink.editor()
+        XCTAssertTrue(form.deletePreset(id: deleted.id))
+        sink.fail = true
+        XCTAssertTrue(form.restoreDefaultPresets().isEmpty)
+        sink.fail = false
+        form.draft.presets.append(Preset.defaults[1])
+        let beforeUndo = form.draft
+        XCTAssertNil(form.undoDeletePreset())
+        XCTAssertEqual(form.draft, beforeUndo)
+        XCTAssertEqual(form.error, "无法撤销删除：此预设已存在。")
+        form.draft.presets.removeAll { $0.id == deleted.id }
+        XCTAssertEqual(form.restoreDefaultPresets(), [deleted.id])
+        XCTAssertEqual(form.undoDeletePreset(), deleted.id)
+        XCTAssertEqual(form.draft, configuration)
+    }
+
+    @MainActor func testRestoringOtherDefaultsAndNoOpRestoreRetainPriorReplacementUntilUndo() {
+        var configuration = Configuration(language: .simplifiedChinese)
+        configuration.presets[1].name = "Deleted custom name"
+        let deleted = configuration.presets[1]
+        let sink = PresetTransactionSink(configuration); let form = sink.editor()
+        XCTAssertTrue(form.deletePreset(id: deleted.id))
+        XCTAssertEqual(form.restoreDefaultPresets(), [deleted.id])
+        let otherDefault = configuration.presets[3]
+        form.draft.presets.removeAll { $0.id == otherDefault.id }
+        sink.fail = true
+        XCTAssertTrue(form.restoreDefaultPresets().isEmpty)
+        XCTAssertFalse(form.deletePreset(id: form.draft.presets[0].id))
+        XCTAssertEqual(form.lastDeletedPreset, deleted)
+        sink.fail = false
+        XCTAssertEqual(form.restoreDefaultPresets(), [otherDefault.id])
+        XCTAssertTrue(form.restoreDefaultPresets().isEmpty)
+        var expected = form.draft
+        expected.presets.removeAll { $0.id == deleted.id }
+        expected.presets.insert(deleted, at: 1)
+        XCTAssertEqual(form.undoDeletePreset(), deleted.id)
+        XCTAssertEqual(form.draft, expected)
+        XCTAssertEqual(form.draft.presets.last, otherDefault)
+    }
+
+    @MainActor func testLaterSuccessfulDeleteClearsPriorRestoreReplacementAuthority() {
+        var configuration = Configuration(language: .simplifiedChinese)
+        configuration.presets[1].name = "Deleted custom name"
+        let deleted = configuration.presets[1]
+        let sink = PresetTransactionSink(configuration); let form = sink.editor()
+        XCTAssertTrue(form.deletePreset(id: deleted.id))
+        XCTAssertEqual(form.restoreDefaultPresets(), [deleted.id])
+        let restored = Preset.defaults[1]
+        XCTAssertTrue(form.deletePreset(id: restored.id))
+        XCTAssertEqual(form.lastDeletedPreset, restored)
+        form.draft.presets.append(restored)
+        let beforeUndo = form.draft
+        XCTAssertNil(form.undoDeletePreset())
+        XCTAssertEqual(form.draft, beforeUndo)
+        XCTAssertEqual(form.error, "无法撤销删除：此预设已存在。")
+        form.dismissDeletedPreset()
+        XCTAssertNil(form.lastDeletedPreset)
+        let writes = sink.writes
+        XCTAssertNil(form.undoDeletePreset())
+        XCTAssertEqual(sink.writes, writes)
+        XCTAssertEqual(form.draft, beforeUndo)
+    }
+
     @MainActor func testDeleteUndoRestoresIdentityContentShortcutAndOriginalPositionWithoutOverwritingLaterEdits() throws {
         var configuration = Configuration(language: .simplifiedChinese)
         configuration.presets[2].name = "My 名称"; configuration.presets[2].prompt = "My prompt\n用户内容"
