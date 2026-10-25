@@ -33,7 +33,6 @@ import CryptoKit
         statusItem.button?.image = image
         statusItem.button?.title = ""
         statusItem.button?.imagePosition = .imageOnly
-        statusItem.button?.toolTip = L10n.string("大爆炸 · 按 ⌃⌥1 / 2 / 3 / 4 / 5 处理文本")
         hotKeys.onTrigger = { [weak self] preset in self?.trigger(preset) }
         let testing = CommandLine.arguments.contains("--smoke-test") || CommandLine.arguments.contains("--integration-test") ||
             CommandLine.arguments.contains("--selection-test") || CommandLine.arguments.contains("--sticky-selection-test") ||
@@ -149,7 +148,6 @@ import CryptoKit
         setupMainMenu()
         statusItem.button?.setAccessibilityLabel(L10n.string("大爆炸"))
         rebuildMenu(configuration: configuration)
-        statusItem.button?.toolTip = L10n.string("大爆炸 · 按 ⌃⌥1 / 2 / 3 / 4 / 5 处理文本")
         settingsWindow?.title = L10n.string("大爆炸设置")
         for sticky in stickies.values { sticky.updateConfiguration(configuration) }
     }
@@ -205,6 +203,8 @@ import CryptoKit
     @objc private func pasteFromMenu(_ sender: Any?) { forwardClipboardAction(#selector(NSText.paste(_:)), sender: sender) }
     private func rebuildMenu(configuration: Configuration? = nil) {
         let configuration = configuration ?? store.configuration
+        statusItem.button?.toolTip = ([L10n.string("大爆炸 · 选中文字后使用快捷键", language: configuration.language)] +
+            configuration.presets.map { "\($0.name)  \($0.shortcut.label)" }).joined(separator: "\n")
         let menu = NSMenu()
         menu.addItem(withTitle: L10n.string("大爆炸 · 选中文字后使用快捷键"), action: nil, keyEquivalent: "")
         for preset in configuration.presets {
@@ -527,7 +527,10 @@ import CryptoKit
             print("DIAGNOSTIC: settings-version language=en expected=Version \(versionValue) observed=\(versionText() ?? "<missing>")")
             checks["languagePersistsAcrossStoreReload"] = SettingsStore(defaults: defaults).configuration == isolatedStore.configuration
             checks["englishApplicationTitleAndTooltip"] = preview.title == "Big Bang Settings" &&
-                note.window?.title == "Big Bang · 📝 Summarize" && statusItem.button?.toolTip == "Big Bang · Press ⌃⌥1 / 2 / 3 / 4 / 5 to process text"
+                note.window?.title == "Big Bang · 📝 Summarize" &&
+                statusItem.button?.toolTip?.hasPrefix("Big Bang · Select text, then use a shortcut\n") == true &&
+                statusItem.button?.toolTip?.contains("🌐 Translate  ⌃⌥1") == true &&
+                statusItem.button?.toolTip?.contains("🤖 Assistant  ⌃⌥5") == true
             checks["englishStatusAccessibility"] = statusItem.button?.accessibilityLabel() == "Big Bang"
             checks["menuLanguageUpdatesImmediately"] = statusItem.menu?.items.contains(where: { $0.title == "Settings…" }) == true &&
                 NSApp.mainMenu?.items.last?.title == "Edit"
@@ -608,7 +611,13 @@ import CryptoKit
                 editor.draft.presets.count == previousCount + 1 && editor.draft.presets.last?.name == "New Preset" &&
                     editor.draft.presets.last?.prompt == "Process the text provided by the user."
             }
+            editor.draft.presets[editor.draft.presets.count - 1].name = "My Custom Action"
+            editor.draft.presets[editor.draft.presets.count - 1].shortcut = .init(keyCode: 40, modifiers: 6144, label: "⌃⌥K")
+            editor.flush()
             let custom = editor.draft.presets.last!
+            checks["statusTooltipReflectsSavedCustomNameAndShortcut"] =
+                statusItem.button?.toolTip?.hasSuffix("My Custom Action  ⌃⌥K") == true &&
+                statusItem.button?.toolTip?.contains("⌃⌥6") == false
             _ = press("settings.section.connection")
             checks["englishConnectionLabelsRendered"] = await waitFor { label(preview, "settings.endpoint") == "API URL" }
             snapshot(preview, name: "settings-connection-en.png", includeFrame: true)
@@ -634,7 +643,10 @@ import CryptoKit
                 statusItem.menu?.items.contains(where: { $0.title == "🤖 助手    ⌃⌥5" }) == true &&
                 note.model.availablePresets.contains(where: { $0.id == Preset.defaults[4].id && $0.name == "🤖 助手" })
             checks["chineseApplicationTitleAndTooltip"] = preview.title == "大爆炸设置" && note.window?.title == "大爆炸 · 📝 总结" &&
-                statusItem.button?.toolTip == "大爆炸 · 按 ⌃⌥1 / 2 / 3 / 4 / 5 处理文本" && statusItem.button?.accessibilityLabel() == "大爆炸"
+                statusItem.button?.toolTip?.hasPrefix("大爆炸 · 选中文字后使用快捷键\n") == true &&
+                statusItem.button?.toolTip?.contains("🌐 翻译  ⌃⌥1") == true &&
+                statusItem.button?.toolTip?.hasSuffix("My Custom Action  ⌃⌥K") == true &&
+                statusItem.button?.accessibilityLabel() == "大爆炸"
             checks["menuAndExistingNoteSwitchBack"] = statusItem.menu?.items.contains(where: { $0.title == "设置…" }) == true &&
                 note.model.displayedPresetName == "📝 总结" && note.model.displayedState == "已完成"
             _ = press("settings.section.presets")
