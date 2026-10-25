@@ -180,16 +180,7 @@ import Combine
             candidate.presets.append(preset); added.append(preset.id)
         }
         guard !added.isEmpty else { return [] }
-        do { try candidate.validate() } catch { self.error = error.localizedDescription; return [] }
-        let previousDraft = draft
-        savingPresetTransaction = true
-        draft = candidate // A single immediate save for the complete restoration.
-        savingPresetTransaction = false
-        guard error == nil else {
-            suppressDraftSave = true; draft = previousDraft; suppressDraftSave = false
-            return []
-        }
-        return added
+        return persistPresetTransaction(candidate) ? added : []
     }
     /// Moves an existing preset by one place and persists the complete order atomically.
     @discardableResult public func movePreset(id: UUID, by distance: Int) -> Bool {

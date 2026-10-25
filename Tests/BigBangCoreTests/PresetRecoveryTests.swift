@@ -5,19 +5,67 @@ import XCTest
     var configuration: Configuration
     var writes = 0
     var keyWrites = 0
+    var savedKeys: [String] = []
+    var keyDidSave: (() -> Void)?
     var fail = false
     init(_ configuration: Configuration = Configuration(language: .simplifiedChinese)) { self.configuration = configuration }
-    func editor() -> SettingsEditor {
-        SettingsEditor(configuration: configuration, hasKey: true, saveDelay: .seconds(30), save: { candidate, key in
+    func editor(saveDelay: Duration = .seconds(30)) -> SettingsEditor {
+        SettingsEditor(configuration: configuration, hasKey: true, saveDelay: saveDelay, save: { candidate, key in
             if self.fail { throw ValidationError("保存失败") }
             try candidate.validate()
             self.configuration = candidate; self.writes += 1
-            if !key.isEmpty { self.keyWrites += 1 }
+            if !key.isEmpty { self.keyWrites += 1; self.savedKeys.append(key); self.keyDidSave?() }
         }, deleteKey: { XCTFail("恢复预设不能删除 Key") })
     }
 }
 
 final class PresetRecoveryTests: XCTestCase {
+    @MainActor func testPendingKeyAutosavesAfterRestoreWithoutAnotherConfigurationWrite() async {
+        var configuration = Configuration(language: .simplifiedChinese); configuration.presets.remove(at: 1)
+        let sink = PresetRecoverySink(configuration); let form = sink.editor(saveDelay: .milliseconds(30))
+        let keySaved = expectation(description: "Pending credential is saved after restoring defaults")
+        keySaved.assertForOverFulfill = true
+        sink.keyDidSave = { keySaved.fulfill() }
+        form.apiKeyInput = "synthetic-recovery-key"
+        XCTAssertEqual(form.restoreDefaultPresets().count, 1)
+        let restored = form.draft
+        XCTAssertEqual(sink.configuration, restored)
+        XCTAssertEqual(sink.writes, 1)
+        XCTAssertEqual(sink.keyWrites, 0)
+        await fulfillment(of: [keySaved], timeout: 2)
+        XCTAssertEqual(sink.savedKeys, ["synthetic-recovery-key"])
+        XCTAssertEqual(sink.configuration, restored)
+        XCTAssertEqual(sink.writes, 2)
+        form.flush()
+        XCTAssertEqual(sink.writes, 2)
+    }
+    @MainActor func testPendingKeyAutosavesUsingRolledBackDraftAfterFailedRestoreAndRestoreCanRetry() async {
+        var configuration = Configuration(language: .simplifiedChinese); configuration.presets.remove(at: 1)
+        let sink = PresetRecoverySink(configuration); let form = sink.editor(saveDelay: .milliseconds(30))
+        let keySaved = expectation(description: "Pending credential is saved using the configuration before failed restoration")
+        keySaved.assertForOverFulfill = true
+        sink.keyDidSave = { keySaved.fulfill() }
+        form.apiKeyInput = "synthetic-recovery-key"
+        sink.fail = true
+        XCTAssertTrue(form.restoreDefaultPresets().isEmpty)
+        XCTAssertEqual(form.draft, configuration)
+        XCTAssertEqual(sink.configuration, configuration)
+        XCTAssertEqual(sink.writes, 0)
+        XCTAssertEqual(sink.keyWrites, 0)
+        XCTAssertNotNil(form.error)
+        sink.fail = false
+        await fulfillment(of: [keySaved], timeout: 2)
+        XCTAssertEqual(sink.savedKeys, ["synthetic-recovery-key"])
+        XCTAssertEqual(sink.configuration, configuration)
+        XCTAssertEqual(sink.writes, 1)
+        XCTAssertNil(form.error)
+        XCTAssertEqual(form.restoreDefaultPresets().count, 1)
+        XCTAssertEqual(sink.configuration, form.draft)
+        XCTAssertEqual(sink.writes, 2)
+        XCTAssertEqual(sink.keyWrites, 1)
+        form.flush()
+        XCTAssertEqual(sink.writes, 2)
+    }
     func testDecodingCustomPresetDoesNotInferIdentityOrRewriteContent() throws {
         var preset = Preset.defaults[0]
         preset.builtIn = nil
