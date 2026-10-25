@@ -311,7 +311,8 @@ import CryptoKit
         }
         if Task.isCancelled || sticky.captureCancelled {
             sticky.model.finishCapture(needsInput: true)
-            sticky.window?.makeKeyAndOrderFront(nil)
+            // Manual takeover already focused the editor. Clipboard cleanup may
+            // finish after the user chooses another window; keep that newer focus.
             return sticky
         }
         let text: String

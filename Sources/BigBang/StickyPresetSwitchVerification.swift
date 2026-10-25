@@ -311,14 +311,131 @@ import BigBangSelection
 }
 
 extension StickyPresetSwitchVerification {
+    /// A late selection cleanup must respect the user's more recent window choice.
+    private static func verifyCaptureCleanupFocus(
+        open: @escaping (Preset, @escaping () async throws -> String, @escaping () throws -> String,
+               @escaping (StickyWindow, Configuration, String) -> Void) async throws -> StickyWindow
+    ) async -> [String: Bool] {
+        var checks: [String: Bool] = [:]
+        // Keep prior windows alive so AppKit cannot recycle their object identities
+        // into the next scenario's newly created panel.
+        var ownedNotes: [StickyWindow] = []
+        let originalApplication = NSWorkspace.shared.frontmostApplication
+        let preset = Preset.defaults(for: .simplifiedChinese)[0]
+        for scenario in ["stay", "switchAway", "returnBeforeCleanup"] {
+            let prefix = "captureFocus.\(scenario)."
+            let previousWindows = Set(NSApp.windows.map(ObjectIdentifier.init))
+            var continuation: CheckedContinuation<String, Error>?
+            var keyReads = 0
+            var requests: [String] = []
+            let pending = Task { @MainActor in
+                try await open(preset, {
+                    try await withCheckedThrowingContinuation { continuation = $0 }
+                }, { keyReads += 1; return "fixture-key" }, { note, _, _ in
+                    requests.append(note.model.source)
+                })
+            }
+            let started = await waitFor { continuation != nil }
+            let note = NSApp.windows.first {
+                $0 is StickyPanel && $0.isVisible && !previousWindows.contains(ObjectIdentifier($0))
+            }?.windowController as? StickyWindow
+            guard started, let note, let panel = note.window else {
+                checks[prefix + "selectionBoundaryReached"] = false
+                continuation?.resume(returning: "")
+                pending.cancel()
+                _ = try? await pending.value
+                note?.window?.close()
+                continue
+            }
+            ownedNotes.append(note)
+            panel.makeKeyAndOrderFront(nil)
+            let ready = await waitFor {
+                guard let editor = input(in: note.hostingView) else { return false }
+                return panel.isKeyWindow && panel.firstResponder === editor &&
+                    note.captureCancelled && note.model.awaitingInput && note.model.capturingSelection
+            }
+            checks[prefix + "takeoverReadyBeforeCleanup"] = ready
+            let editor = input(in: note.hostingView)
+            let draft = "User draft \(scenario)"
+            editor?.insertText(draft, replacementRange: NSRange(location: 0, length: editor?.string.utf16.count ?? 0))
+            checks[prefix + "draftAcceptedBeforeCleanup"] = await waitFor { note.model.draft == draft }
+
+            let sentinel = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 320, height: 140),
+                styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            sentinel.isReleasedWhenClosed = false
+            sentinel.title = "Capture focus fixture"
+            let sentinelText = NSTextView(frame: NSRect(x: 0, y: 0, width: 320, height: 140))
+            sentinelText.string = "Keep keyboard focus here"
+            sentinel.contentView = sentinelText
+            if scenario != "stay" {
+                NSApp.activate(ignoringOtherApps: true)
+                sentinel.makeKeyAndOrderFront(nil)
+                sentinel.makeFirstResponder(sentinelText)
+                checks[prefix + "newWindowOwnsFocus"] = await waitFor {
+                    sentinel.isKeyWindow && sentinel.firstResponder === sentinelText && !panel.isKeyWindow
+                }
+                if scenario == "returnBeforeCleanup" {
+                    panel.makeKeyAndOrderFront(nil)
+                    checks[prefix + "explicitReturnOwnsFocus"] = await waitFor { panel.isKeyWindow }
+                }
+            }
+            continuation?.resume(returning: "Late selection must be ignored")
+            continuation = nil
+            do {
+                let completed = try await pending.value
+                // Flush queued SwiftUI/editor updates as well as the immediate completion.
+                try? await Task.sleep(for: .milliseconds(100))
+                checks[prefix + "cleanupPreservesDraftWithoutRequest"] = completed === note &&
+                    note.model.awaitingInput && !note.model.capturingSelection && note.model.draft == draft &&
+                    note.model.source.isEmpty && keyReads == 0 && requests.isEmpty
+                checks[prefix + "cleanupRespectsLatestFocus"] = scenario == "switchAway" ?
+                    sentinel.isKeyWindow && sentinel.firstResponder === sentinelText && !panel.isKeyWindow :
+                    panel.isKeyWindow && panel.firstResponder === editor
+                if scenario == "switchAway" { panel.makeKeyAndOrderFront(nil) }
+                checks[prefix + "explicitReturnRemainsEditable"] = await waitFor {
+                    panel.isKeyWindow && panel.firstResponder === input(in: note.hostingView) && note.model.canSubmit
+                }
+                note.model.submit?()
+                checks[prefix + "explicitSubmissionUsesDraftExactlyOnce"] = requests == [draft] && keyReads == 1
+                if checks[prefix + "explicitSubmissionUsesDraftExactlyOnce"] == false {
+                    print("Capture focus fixture \(scenario): keyReads=\(keyReads), requests=\(requests.count), sourceMatches=\(note.model.source == draft), error=\(note.model.error ?? "none"), marked=\(editor?.hasMarkedText() ?? false)")
+                }
+            } catch {
+                checks[prefix + "cleanupCompletes"] = false
+            }
+            panel.close()
+            sentinel.close()
+        }
+        if let originalApplication, originalApplication.processIdentifier != ProcessInfo.processInfo.processIdentifier {
+            originalApplication.activate(options: [])
+            checks["captureFocus.restoresForegroundApplication"] = await waitFor {
+                NSWorkspace.shared.frontmostApplication?.processIdentifier == originalApplication.processIdentifier
+            }
+        }
+        return checks
+    }
+
     /// The production selection-to-note path, with an injected selection boundary and request sink.
     static func runManualInput(reportURL: URL,
         open: @escaping (Preset, @escaping () async throws -> String, @escaping () throws -> String,
                @escaping (StickyWindow, Configuration, String) -> Void) async throws -> StickyWindow) async {
+        if CommandLine.arguments.contains("--capture-focus-only") {
+            let checks = await verifyCaptureCleanupFocus(open: open)
+            let report: [String: Any] = ["passed": !checks.isEmpty && checks.values.allSatisfy { $0 },
+                "checks": checks,
+                "scope": "Production selection-to-note path with a gated selection and native owned windows. User takeover, switching away, and explicit return before/after cleanup. In-memory draft and request sink; no clipboard, external application, Keychain, settings writes or model calls."]
+            do {
+                try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
+                    .write(to: reportURL, options: .atomic)
+            } catch { fputs("Capture focus report: \(error)\n", stderr) }
+            NSApp.terminate(nil)
+            return
+        }
         var checks: [String: Bool] = [:]
         var diagnostics: [String: Any] = [:]
         var errors: [String] = []
         var notes: [StickyWindow] = []
+        checks.merge(await verifyCaptureCleanupFocus(open: open)) { _, new in new }
         if let index = CommandLine.arguments.firstIndex(of: "--fixture-app") {
             if CommandLine.arguments.indices.contains(index + 1) {
                 let result = await verifyNativeAX(fixturePath: CommandLine.arguments[index + 1], reportURL: reportURL)
