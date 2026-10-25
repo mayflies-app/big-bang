@@ -224,9 +224,63 @@ import BigBangCore
             checks["fallbackTextRemainsSelectable"] = await wait { text.selectedText == "资源故障原文 🌍" }
             checks["fallbackNativeSelectionSnapshot"] = (try? await note.selectedOutputTextSnapshot()) == "资源故障原文 🌍"
             checks["fallbackScreenshotSaved"] = await snapshot(text, reportURL: reportURL, name: "markdown-resource-fallback.png")
+            let fallbackSelection = "资源故障原文 🌍"
+            let fallbackRange = (fallbackSource as NSString).range(of: fallbackSelection)
+            func selectFallbackText() async -> Bool {
+                // A repeated range can already match the native cache while its
+                // asynchronous user-selection event is still in flight. Establish
+                // a fresh selection before the next explicit follow action.
+                text.setSelectedRange(NSRange(location: 0, length: 0))
+                guard await wait({ text.selectedText.isEmpty && text.selectedRange().length == 0 }) else { return false }
+                text.setSelectedRange(fallbackRange)
+                return await wait { text.selectedText == fallbackSelection && text.selectedRange() == fallbackRange && !note.model.autoScroll }
+            }
+            func fallbackSelectionIsIntact() async -> Bool {
+                (try? await text.selectionSnapshot()) == fallbackSelection && text.selectedText == fallbackSelection && text.selectedRange() == fallbackRange
+            }
             note.model.output += "\n\n追加流式原文 **保持可读**。"
             checks["fallbackStreamingUpdatesSource"] = await rendered(text, source: note.model.output)
             checks["fallbackStreamingRemainsInert"] = await waitJS(text, "document.querySelector('#markdown-root').textContent.includes('追加流式原文 **保持可读**。') && window.fallbackInjected !== true")
+            await pause(160)
+            checks["fallbackStreamingPreservesLiveUnicodeSelection"] = await fallbackSelectionIsIntact()
+
+            // Reset the user selection for each redraw so a prior failure cannot
+            // make the appearance/language cases pass with an already empty range.
+            let languageSelectionReady = await selectFallbackText()
+            let languageRevision = text.revision
+            note.setLanguage(to: .english)
+            checks["fallbackLanguageChangeRendered"] = await wait { text.revision > languageRevision && text.renderingComplete }
+            await pause(160)
+            let languageSelectionIntact = await fallbackSelectionIsIntact()
+            checks["fallbackLanguageChangePreservesSelection"] = languageSelectionReady && languageSelectionIntact
+
+            let appearanceSelectionReady = await selectFallbackText()
+            let appearanceRevision = text.revision
+            window.appearance = NSAppearance(named: .aqua)
+            checks["fallbackAppearanceChangeRendered"] = await wait { text.revision > appearanceRevision && text.renderingComplete }
+            await pause(160)
+            let appearanceSelectionIntact = await fallbackSelectionIsIntact()
+            checks["fallbackAppearanceChangePreservesSelection"] = appearanceSelectionReady && appearanceSelectionIntact
+
+            let followingSelectionReady = await selectFallbackText()
+            note.model.autoScroll = true
+            note.model.output += "\n\n继续跟随的新内容。"
+            checks["fallbackFollowingGrowthRendered"] = await rendered(text, source: note.model.output)
+            await pause(160)
+            let followingSelectionIntact = await fallbackSelectionIsIntact()
+            observations["fallbackFollowingSelection"] = ["selectionEstablishedBeforeFollowing": followingSelectionReady,
+                "liveSelectionIntactAfterGrowth": followingSelectionIntact, "followingAfterGrowth": note.model.autoScroll,
+                "nativeRange": NSStringFromRange(text.selectedRange()), "expectedRange": NSStringFromRange(fallbackRange)]
+            checks["fallbackRestoredSelectionKeepsExplicitFollowing"] = followingSelectionReady &&
+                followingSelectionIntact && note.model.autoScroll
+
+            let obsoleteSelectionReady = await selectFallbackText()
+            note.model.output = "全新的结果，不含旧的选中文本。"
+            checks["fallbackReplacementRendered"] = await rendered(text, source: note.model.output)
+            await pause(160)
+            let replacedSelection = try? await text.selectionSnapshot()
+            checks["fallbackReplacementClearsObsoleteSelection"] = obsoleteSelectionReady && replacedSelection == "" &&
+                text.selectedText.isEmpty && text.selectedRange().length == 0
             observations["fallbackRenderer"] = await diagnostics(text)
         } catch {
             observations["error"] = error.localizedDescription

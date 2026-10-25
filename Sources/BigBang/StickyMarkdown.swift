@@ -381,10 +381,26 @@ struct StickyMarkdownView: NSViewRepresentable {
               const r=s.getRangeAt(0);if(!root.contains(r.startContainer)||!root.contains(r.endContainer))return {revision,location:0,length:0,text:''};
               const p=document.createRange();p.selectNodeContents(root);p.setEnd(r.startContainer,r.startOffset);
               return {revision,location:p.toString().length,length:r.toString().length,text:s.toString()};};
-            window.sticky={render:p=>{revision=p.revision;root.textContent=p.text;root.style.color=p.dark?'#ededed':'#222';layout();},selection,
-              selectRange:(location,length,restoring=false)=>{restoredSelection=null;const n=root.firstChild;if(!n)return;const r=document.createRange(),s=getSelection();
+            const selectRange=(location,length,restoring=false)=>{restoredSelection=null;const n=root.firstChild;if(!n)return;const r=document.createRange(),s=getSelection();
                 const start=Math.min(n.length,Math.max(0,location));r.setStart(n,start);r.setEnd(n,Math.min(n.length,start+Math.max(0,length)));s.removeAllRanges();s.addRange(r);
-                if(restoring)restoredSelection=selection();}};
+                if(restoring)restoredSelection=selection();};
+            const captureSelection=()=>{const current=selection();if(!current.length)return null;const value=root.textContent;
+              return {...current,fragment:value.slice(current.location,current.location+current.length),
+                before:value.slice(Math.max(0,current.location-32),current.location),after:value.slice(current.location+current.length,current.location+current.length+32)};};
+            const restoreSelection=saved=>{restoredSelection=null;getSelection().removeAllRanges();
+              if(saved){const value=root.textContent,occurrences=[];let position=-1;
+                while((position=value.indexOf(saved.fragment,position+1))>=0)occurrences.push(position);
+                if(occurrences.length){const affinity=position=>{
+                  const before=value.slice(Math.max(0,position-32),position),after=value.slice(position+saved.fragment.length,position+saved.fragment.length+32);
+                  let score=-Math.abs(position-saved.location)/Math.max(1,value.length);
+                  for(let i=1;i<=Math.min(before.length,saved.before.length);i++){if(before.at(-i)!==saved.before.at(-i))break;score+=1;}
+                  for(let i=0;i<Math.min(after.length,saved.after.length);i++){if(after[i]!==saved.after[i])break;score+=1;}return score;};
+                  const best=occurrences.reduce((a,b)=>affinity(b)>affinity(a)?b:a);selectRange(best,saved.fragment.length,true);}}
+              // Publish even an empty restored selection: WebKit may coalesce its
+              // selectionchange events while replacing the text node.
+              restoredSelection=selection();post({type:'selection',...restoredSelection,restored:true});};
+            window.sticky={render:p=>{const saved=captureSelection();revision=p.revision;root.textContent=p.text;
+              root.style.color=p.dark?'#ededed':'#222';restoreSelection(saved);layout();},selection,selectRange};
             document.addEventListener('selectionchange',()=>{const current=selection();
               const restored=restoredSelection!==null&&['revision','location','length','text'].every(k=>current[k]===restoredSelection[k]);
               if(!restored)restoredSelection=null;post({type:'selection',...current,restored});});
