@@ -6,6 +6,19 @@ import BigBangCore
 /// All persistence and login-item operations remain in memory.
 @MainActor enum SettingsInputVerification {
     static func run(reportURL: URL, verifyHotkeys: () async -> [String: Bool]) async {
+        if CommandLine.arguments.contains("--shortcut-labels-only") {
+            let labels = await verifyShortcutLabels()
+            let report: [String: Any] = ["passed": !labels.checks.isEmpty && labels.checks.values.allSatisfy { $0 },
+                "checks": labels.checks, "observations": labels.observations, "fixtureErrors": [String](),
+                "scope": "Real RecorderButton in an owned SettingsWindow; in-process native key events verify readable special-key labels, unchanged key codes and modifiers, cancellation and rejected input. No clipboard, global hotkeys, Keychain, settings writes or model calls."]
+            do {
+                try FileManager.default.createDirectory(at: reportURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
+                    .write(to: reportURL, options: .atomic)
+            } catch { fputs("Shortcut labels report: \(error.localizedDescription)\n", stderr) }
+            NSApp.terminate(nil)
+            return
+        }
         let lifecycle = await FocusLifecycleVerification.run()
         if CommandLine.arguments.contains("--focus-lifecycle-only") {
             let report: [String: Any] = ["passed": !lifecycle.checks.isEmpty && lifecycle.checks.values.allSatisfy { $0 },
@@ -22,6 +35,9 @@ import BigBangCore
         let fixture = Fixture(reportDirectory: reportURL.deletingLastPathComponent())
         fixture.checks.merge(lifecycle.checks) { _, new in new }
         fixture.observations.append(contentsOf: lifecycle.observations)
+        let labels = await verifyShortcutLabels()
+        fixture.checks.merge(labels.checks) { _, new in new }
+        fixture.observations.append(contentsOf: labels.observations)
         do { try await fixture.run() }
         catch {
             fixture.checks["fixture.targetAcquisition"] = false
@@ -46,6 +62,90 @@ import BigBangCore
         } catch { fputs("Settings input report: \(error.localizedDescription)\n", stderr) }
         fixture.window.close()
         NSApp.terminate(nil)
+    }
+
+    private static func verifyShortcutLabels() async -> (checks: [String: Bool], observations: [[String: Any]]) {
+        var checks: [String: Bool] = [:]
+        var observations: [[String: Any]] = []
+        let foreground = NSWorkspace.shared.frontmostApplication
+        let window = SettingsWindow()
+        let recorder = RecorderButton(frame: NSRect(x: 40, y: 40, width: 200, height: 32))
+        window.contentView = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 120))
+        window.contentView?.addSubview(recorder)
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        for _ in 0..<50 {
+            if window.isKeyWindow { break }
+            await pause(20)
+        }
+        checks["shortcutLabels.nativeRecorderOwnsKeyWindow"] = window.isKeyWindow && recorder.window === window
+        defer {
+            recorder.endRecording()
+            window.close()
+            foreground?.activate(options: [])
+        }
+        func send(_ characters: String, keyCode: UInt16,
+                  modifiers: NSEvent.ModifierFlags = [.control, .option]) -> Bool {
+            guard let event = NSEvent.keyEvent(with: .keyDown, location: .zero,
+                modifierFlags: modifiers, timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: window.windowNumber, context: nil, characters: characters,
+                charactersIgnoringModifiers: characters, isARepeat: false, keyCode: keyCode) else { return false }
+            NSApp.sendEvent(event)
+            return true
+        }
+        let cases: [(name: String, keyCode: UInt16, characters: String, expected: String)] = [
+            ("return", 36, "\r", "⏎"), ("tab", 48, "\t", "⇥"),
+            ("delete", 51, "\u{7f}", "⌫"), ("space", 49, " ", "␣"),
+            ("left", 123, "\u{f702}", "←"), ("right", 124, "\u{f703}", "→"),
+            ("down", 125, "\u{f701}", "↓"), ("up", 126, "\u{f700}", "↑"),
+            ("f1", 122, "\u{f704}", "F1"), ("f20", 90, "\u{f717}", "F20"),
+            ("keypadEnter", 76, "\u{3}", "⌅"), ("forwardDelete", 117, "\u{f728}", "⌦"),
+            ("ordinaryLetter", 40, "k", "K"), ("ordinaryDigit", 18, "1", "1"),
+            ("emptyCharacterFallback", 10, "", "Key 10")
+        ]
+        for language in [AppLanguage.simplifiedChinese, .english] {
+            recorder.language = language
+            let prefix = "shortcutLabels.\(language.rawValue)."
+            for item in cases {
+                var recorded: [Shortcut] = []
+                var changes: [Bool] = []
+                recorder.title = "⌃⌥1"
+                recorder.onRecord = { recorded.append($0) }
+                recorder.onRecordingChange = { changes.append($0) }
+                recorder.beginRecording()
+                let began = window.firstResponder === recorder && changes == [true]
+                let sent = send(item.characters, keyCode: item.keyCode)
+                let expected = "⌃⌥" + item.expected
+                checks[prefix + item.name + ".readableLabel"] = began && sent && recorded.count == 1 &&
+                    recorded.first?.label == expected && recorder.title == expected
+                checks[prefix + item.name + ".preservesKeyAndModifiers"] = recorded.first?.keyCode == UInt32(item.keyCode) &&
+                    recorded.first?.modifiers == 6144 && changes == [true, false]
+                observations.append(["phase": prefix + item.name, "expected": expected,
+                    "actual": recorder.title, "recordedCount": recorded.count,
+                    "keyCode": Int(recorded.first?.keyCode ?? 0), "modifiers": Int(recorded.first?.modifiers ?? 0)])
+                recorder.endRecording()
+            }
+            var recorded: [Shortcut] = []
+            var changes: [Bool] = []
+            recorder.title = "⌃⌥K"
+            recorder.onRecord = { recorded.append($0) }
+            recorder.onRecordingChange = { changes.append($0) }
+            recorder.beginRecording()
+            let escaped = send("\u{1b}", keyCode: 53, modifiers: [])
+            checks[prefix + "escapeCancelsWithoutChangingShortcut"] = escaped && recorded.isEmpty &&
+                recorder.title == "⌃⌥K" && changes == [true, false] && window.isVisible
+            changes.removeAll()
+            recorder.beginRecording()
+            let rejected = send("k", keyCode: 40, modifiers: [.shift])
+            checks[prefix + "shiftAloneKeepsRecordingWithoutSaving"] = rejected && recorded.isEmpty && changes == [true] &&
+                window.firstResponder === recorder && recorder.title == L10n.string("按下快捷键…", language: language)
+            let accepted = send("k", keyCode: 40, modifiers: [.control, .option, .shift, .command])
+            checks[prefix + "validInputAfterRejectionPreservesAllModifiers"] = accepted && recorded.count == 1 &&
+                recorded.first == Shortcut(keyCode: 40, modifiers: 6912, label: "⌃⌥⇧⌘K") &&
+                changes == [true, false]
+            recorder.endRecording()
+        }
+        return (checks, observations)
     }
 
     @MainActor private final class Fixture: NSObject, NSWindowDelegate {

@@ -135,10 +135,60 @@ final class RecorderButton: NSButton {
         if flags.contains(.option) { modifiers |= UInt32(optionKey); label += "⌥" }
         if flags.contains(.shift) { modifiers |= UInt32(shiftKey); label += "⇧" }
         if flags.contains(.command) { modifiers |= UInt32(cmdKey); label += "⌘" }
-        label += (event.charactersIgnoringModifiers ?? "Key \(event.keyCode)").uppercased()
+        label += Self.keyLabel(for: event)
         endRecording()
         onRecord?(.init(keyCode: UInt32(event.keyCode), modifiers: modifiers, label: label))
         title = label; window?.makeFirstResponder(nil)
+    }
+    private static func keyLabel(for event: NSEvent) -> String {
+        // Special keys produce control or private-use characters, not visible key names.
+        switch Int(event.keyCode) {
+        case kVK_Return: return "⏎"
+        case kVK_ANSI_KeypadEnter: return "⌅"
+        case kVK_Tab: return "⇥"
+        case kVK_Space: return "␣"
+        case kVK_Delete: return "⌫"
+        case kVK_ForwardDelete: return "⌦"
+        case kVK_ANSI_KeypadClear: return "⌧"
+        case kVK_LeftArrow: return "←"
+        case kVK_RightArrow: return "→"
+        case kVK_DownArrow: return "↓"
+        case kVK_UpArrow: return "↑"
+        case kVK_Home: return "↖"
+        case kVK_End: return "↘"
+        case kVK_PageUp: return "⇞"
+        case kVK_PageDown: return "⇟"
+        case kVK_Help: return "Help"
+        case kVK_F1: return "F1"
+        case kVK_F2: return "F2"
+        case kVK_F3: return "F3"
+        case kVK_F4: return "F4"
+        case kVK_F5: return "F5"
+        case kVK_F6: return "F6"
+        case kVK_F7: return "F7"
+        case kVK_F8: return "F8"
+        case kVK_F9: return "F9"
+        case kVK_F10: return "F10"
+        case kVK_F11: return "F11"
+        case kVK_F12: return "F12"
+        case kVK_F13: return "F13"
+        case kVK_F14: return "F14"
+        case kVK_F15: return "F15"
+        case kVK_F16: return "F16"
+        case kVK_F17: return "F17"
+        case kVK_F18: return "F18"
+        case kVK_F19: return "F19"
+        case kVK_F20: return "F20"
+        default: break
+        }
+        if let characters = event.charactersIgnoringModifiers, !characters.isEmpty,
+           characters.unicodeScalars.allSatisfy({
+               !CharacterSet.controlCharacters.contains($0) && !CharacterSet.whitespacesAndNewlines.contains($0) &&
+                   $0.properties.generalCategory != .privateUse
+           }) {
+            return characters.uppercased()
+        }
+        return "Key \(event.keyCode)"
     }
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         guard recording else { return super.performKeyEquivalent(with: event) }
