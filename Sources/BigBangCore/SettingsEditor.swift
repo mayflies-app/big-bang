@@ -7,7 +7,8 @@ import Combine
         didSet {
             guard !suppressDraftSave, oldValue != draft else { return }
             let immediate = oldValue.copyFallback != draft.copyFallback || oldValue.apiMode != draft.apiMode || oldValue.language != draft.language ||
-                oldValue.presets.map(\.shortcut) != draft.presets.map(\.shortcut) || oldValue.presets.map(\.id) != draft.presets.map(\.id)
+                oldValue.presets.map(\.shortcut) != draft.presets.map(\.shortcut) || oldValue.presets.map(\.id) != draft.presets.map(\.id) ||
+                oldValue.presets.map(\.directInput) != draft.presets.map(\.directInput)
             if immediate { flush() } else { scheduleSave() }
         }
     }

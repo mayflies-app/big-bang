@@ -48,6 +48,26 @@ final class SettingsEditorTests: XCTestCase {
         form.draft.presets[0].shortcut = .init(keyCode: 22, modifiers: 6144, label: "⌃⌥6")
         XCTAssertEqual(sink.configuration.presets[0].shortcut.keyCode, 22)
     }
+    @MainActor func testDirectInputSwitchSavesImmediatelyAndPreservesOverrides() throws {
+        let sink = SettingsSink()
+        let form = sink.editor()
+        let previousLanguage = L10n.currentLanguage
+        defer { L10n.currentLanguage = previousLanguage }
+        let assistantIndex = try XCTUnwrap(form.draft.presets.firstIndex { $0.builtIn == .assistant })
+        let translationID = form.draft.presets[0].id
+        XCTAssertTrue(form.draft.presets[assistantIndex].directInput)
+        form.draft.presets[0].directInput = true
+        form.draft.presets[assistantIndex].directInput = false
+        XCTAssertEqual(sink.writes, 2)
+        XCTAssertEqual(sink.configuration.presets.filter(\.directInput).map(\.id), [translationID])
+
+        XCTAssertTrue(form.changeLanguage(to: .english))
+        XCTAssertTrue(form.movePreset(id: translationID, by: 1))
+        let reopened = try JSONDecoder().decode(Configuration.self, from: JSONEncoder().encode(sink.configuration))
+        XCTAssertEqual(reopened.presets[1].id, translationID)
+        XCTAssertEqual(reopened.presets.filter(\.directInput).map(\.id), [translationID])
+        XCTAssertEqual(reopened.presets.first { $0.builtIn == .assistant }?.directInput, false)
+    }
     @MainActor func testInvalidEditPreservesSavedSettingsAndRecovers() async {
         let sink = SettingsSink()
         let form = sink.editor()

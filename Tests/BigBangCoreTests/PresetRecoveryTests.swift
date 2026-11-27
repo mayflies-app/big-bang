@@ -83,6 +83,26 @@ final class PresetRecoveryTests: XCTestCase {
         XCTAssertEqual(reopened.presets.map(\.name), ["翻译", "解释", "总结", "可视化", "助手"])
         XCTAssertEqual(reopened, configuration)
     }
+    func testLegacyDirectInputDefaultFollowsBuiltInIdentity() throws {
+        var configuration = Configuration(language: .english)
+        var assistant = try XCTUnwrap(configuration.presets.popLast())
+        let assistantShortcut = assistant.shortcut
+        assistant.name = "Renamed preset"
+        assistant.shortcut = .init(keyCode: 22, modifiers: 6144, label: "⌃⌥6")
+        configuration.presets.insert(assistant, at: 0)
+        configuration.presets.append(Preset(name: "🤖 Assistant", prompt: "Custom", shortcut: assistantShortcut))
+        try configuration.validate()
+
+        let data = try JSONEncoder().encode(configuration)
+        var legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        var presets = try XCTUnwrap(legacy["presets"] as? [[String: Any]])
+        for index in presets.indices { presets[index].removeValue(forKey: "directInput") }
+        legacy["presets"] = presets
+
+        let reopened = try JSONDecoder().decode(Configuration.self, from: JSONSerialization.data(withJSONObject: legacy))
+        XCTAssertEqual(reopened, configuration)
+        XCTAssertEqual(reopened.presets.filter(\.directInput).map(\.id), [assistant.id])
+    }
     @MainActor func testRestoreOneMissingDefaultPreservesExistingEditsAndCustomPreset() {
         var configuration = Configuration(language: .simplifiedChinese)
         configuration.model = "local-model"; configuration.apiBaseURL = "http://localhost:11434/v1"
@@ -183,6 +203,7 @@ final class PresetRecoveryTests: XCTestCase {
             let assistant = try XCTUnwrap(editor.draft.presets.last)
             XCTAssertEqual(assistant.builtIn?.rawValue, "assistant")
             XCTAssertEqual(assistant.name, language == .english ? "🤖 Assistant" : "🤖 助手")
+            XCTAssertTrue(assistant.directInput)
             XCTAssertNotEqual(assistant.shortcut.identity, occupiedFifth.shortcut.identity)
             XCTAssertNoThrow(try editor.draft.validate())
             XCTAssertTrue(editor.restoreDefaultPresets().isEmpty)

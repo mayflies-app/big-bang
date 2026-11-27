@@ -575,6 +575,12 @@ private final class RecorderTitleLabel: NSTextField {
                         identifier: "settings.preset.\(preset.id).prompt", isolatesScrolling: true)
                         .frame(height: 92).padding(8)
                         .modifier(SettingsFieldOutline(palette: palette, focused: focusedField == .prompt(preset.id)))
+                    Toggle(tr("直接输入"), isOn: presetBinding.directInput)
+                        .toggleStyle(.switch).controlSize(.small)
+                        .help(tr("按此预设的快捷键时，跳过选区读取并聚焦输入框。"))
+                        .accessibilityLabel(trFormat("%@的直接输入", preset.name))
+                        .accessibilityHint(tr("按此预设的快捷键时，跳过选区读取并聚焦输入框。"))
+                        .accessibilityIdentifier("settings.preset.\(preset.id).directInput")
                 }.id(preset.id)
                 if preset.id != editor.draft.presets.last?.id {
                     Rectangle().fill(palette.border).frame(height: 1).padding(.vertical, 1).allowsHitTesting(false)

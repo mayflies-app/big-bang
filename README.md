@@ -5,7 +5,7 @@ Process selected text with configurable AI prompts from the macOS menu bar. Resu
 ## Features
 
 - Translate, explain, summarize or visualize selected text with global shortcuts.
-- Add, rename and reorder presets; customize prompts and record shortcuts.
+- Add, rename and reorder presets. Customize prompts, shortcuts and how each shortcut opens a note.
 - Switch the preset in an existing note to process its original input again.
 - Select and copy results, stop or retry a request, pin notes and chain another preset from a note's selection.
 - Render Markdown, tables, code, math and Mermaid diagrams with bundled resources.
@@ -28,9 +28,9 @@ The app bundle is named `BigBang.app`; its English display name is **Big Bang**.
 
 ## Usage
 
-1. Allow Big Bang in **System Settings → Privacy & Security → Accessibility**. Follow any macOS instruction to relaunch after granting permission.
+1. To use selection reading, allow Big Bang in **System Settings → Privacy & Security → Accessibility**. Follow any macOS instruction to relaunch after granting permission.
 2. Open Settings and enter the service's API key, model, base URL and interface type. Changes save automatically after a short typing pause; switches and preset changes save immediately. Invalid settings retain the last valid configuration.
-3. Select text in another app and press a preset shortcut. With copy fallback enabled, release the keys and stay in the source app until copying finishes.
+3. Press a preset shortcut. For presets that read selected text, select text first. With copy fallback enabled, release the keys and stay in the source app until copying finishes.
 
 | Default shortcut | Preset |
 | --- | --- |
@@ -40,13 +40,13 @@ The app bundle is named `BigBang.app`; its English display name is **Big Bang**.
 | `⌃⌥4` | Visualize |
 | `⌃⌥5` | Assistant |
 
-English presets translate non-English text into English and English text into Simplified Chinese. Chinese presets reverse that direction. Explain, Summarize and Visualize use the selected app language. Visualize requests one concise Markdown table or Mermaid diagram without invented data or added explanation. Assistant answers direct questions and carries out requests in an independent turn, using the selected app language unless requested otherwise. Trigger without selected text to type or paste a question. Edited names and prompts, custom presets, order and shortcuts are preserved when changing language. Restore Defaults adds missing built-in presets without replacing existing edits; use it to add Assistant to an existing configuration.
+English presets translate non-English text into English and English text into Simplified Chinese. Chinese presets reverse that direction. Explain, Summarize and Visualize use the selected app language. Visualize requests one concise Markdown table or Mermaid diagram without invented data or added explanation. Assistant answers direct questions and carries out requests in an independent turn, using the selected app language unless requested otherwise. Edited names and prompts, custom presets, order and shortcuts are preserved when changing language. Restore Defaults adds missing built-in presets without replacing existing edits. Use it to add Assistant to an existing configuration.
 
-The shortcut shows a note immediately while selection capture continues without blocking the interface. If no text can be captured, the note becomes a text editor. Choose a preset, type or paste your text, then click **Submit** or press **⌘Enter**. Return inserts a newline; active input-method composition is never submitted. Blank input is not submitted; input over 100 KB or a credential error keeps your draft available to correct and try again.
+Turn on **Direct Input** for any preset in **Settings → Presets**. Its shortcut opens a blank note with the input field focused and skips selection capture. Assistant has Direct Input on by default. Other presets start with it off. In selection mode, the shortcut shows the note while reading. If no text can be captured, the note becomes a text editor. Choose a preset, type or paste your text, then click **Submit** or press **⌘Enter**. Return inserts a newline. Active input-method composition is never submitted. Blank input is not submitted. Input over 100 KB or a credential error keeps your draft available to correct and try again.
 
 Selection capture follows keyboard focus, including nonactivating windows such as the preview opened from a screenshot thumbnail. If the focused control does not expose its selection through Accessibility, enabling Copy Fallback lets Big Bang send ⌘C to that control's application and restore the clipboard's original formats. Changing focus during capture cancels the read so text from another window is not used.
 
-Select a different preset in a note's title to replace its result using the same original input. A running request is cancelled before the replacement starts. Retry uses the current preset and its latest saved prompt. Selecting text inside a note and pressing another preset shortcut creates a new note from that rendered selection.
+Select a different preset in a note's title to replace its result using the same original input. A running request is cancelled before the replacement starts. Retry uses the current preset and its latest saved prompt. To process text selected inside a note in a new note, use a shortcut whose preset has Direct Input off.
 
 Click **Back to Edit** beside Retry to return the note's latest submitted input to the text editor. This cancels any running request and keeps the current preset. Choose **Back to Result** to discard draft changes and restore the previous result, preset, reading position and text selection without another request; a cancelled request stays stopped. Returning also restores keyboard focus to the result unless you have moved focus elsewhere. Or edit the text, then click **Submit** or press **⌘Enter** to replace the result in the same note. Subsequent retries use the edited input.
 

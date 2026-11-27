@@ -58,7 +58,10 @@
 "复制" = "Copy";
 "复制期间前台应用改变，请重试。" = "The foreground app changed while copying. Try again.";
 "大爆炸" = "Big Bang";
-"大爆炸 · 选中文字后使用快捷键" = "Big Bang · Select text, then use a shortcut";
+"大爆炸 · 预设快捷键" = "Big Bang · Preset Shortcuts";
+"直接输入" = "Direct Input";
+"%@的直接输入" = "Direct Input for %@";
+"按此预设的快捷键时，跳过选区读取并聚焦输入框。" = "This preset’s shortcut skips reading selected text and focuses the input field.";
 "大爆炸 · 按 ⌃⌥1 / 2 / 3 / 4 / 5 处理文本" = "Big Bang · Press ⌃⌥1 / 2 / 3 / 4 / 5 to process text";
 "大爆炸应用图标" = "Big Bang app icon";
 "大爆炸设置" = "Big Bang Settings";

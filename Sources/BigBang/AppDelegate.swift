@@ -204,7 +204,7 @@ import CryptoKit
     private func rebuildMenu(configuration: Configuration? = nil) {
         let configuration = configuration ?? store.configuration
         let menu = NSMenu()
-        menu.addItem(withTitle: L10n.string("大爆炸 · 选中文字后使用快捷键"), action: nil, keyEquivalent: "")
+        menu.addItem(withTitle: L10n.string("大爆炸 · 预设快捷键"), action: nil, keyEquivalent: "")
         for preset in configuration.presets {
             menu.addItem(withTitle: "\(preset.name)    \(preset.shortcut.label)", action: nil, keyEquivalent: "")
         }
@@ -268,8 +268,14 @@ import CryptoKit
     private func beginTrigger(_ preset: Preset, readKey: @escaping () throws -> String,
                               start: @escaping (StickyWindow, Configuration, String) -> Void,
                               failure: @escaping (String) -> Void) {
+        // Taking keyboard focus now could interrupt an in-flight copy and clipboard restoration.
         guard !reading else { return }
         guard stickies.count < 8 else { failure(L10n.string("最多同时打开 8 个便签，请先关闭部分便签。")); return }
+        if preset.directInput {
+            let sticky = createTriggeredSticky(preset, capturingSelection: false, readKey: readKey, start: start)
+            sticky.window?.makeKeyAndOrderFront(nil)
+            return
+        }
         let focusedSticky = stickies.values.first(where: { $0.window === NSApp.keyWindow })
         reading = true
         Task { @MainActor [self] in
@@ -289,13 +295,19 @@ import CryptoKit
             } catch { failure(error.localizedDescription) }
         }
     }
+    private func createTriggeredSticky(_ preset: Preset, capturingSelection: Bool,
+                                       readKey: @escaping () throws -> String,
+                                       start: @escaping (StickyWindow, Configuration, String) -> Void) -> StickyWindow {
+        let sticky = createSticky(preset: preset, source: "", capturingSelection: capturingSelection)
+        sticky.configureProcessing(configuration: { [weak self] in self?.store.configuration ?? Configuration() },
+                                   readKey: readKey, start: start)
+        return sticky
+    }
     /// Show the note before reading, while preserving the source application's keyboard focus.
     private func prepareTriggeredSticky(_ preset: Preset, selection: @escaping () async throws -> String,
                                         readKey: @escaping () throws -> String,
                                         start: @escaping (StickyWindow, Configuration, String) -> Void) async throws -> StickyWindow {
-        let sticky = createSticky(preset: preset, source: "", capturingSelection: true)
-        sticky.configureProcessing(configuration: { [weak self] in self?.store.configuration ?? Configuration() },
-                                   readKey: readKey, start: start)
+        let sticky = createTriggeredSticky(preset, capturingSelection: true, readKey: readKey, start: start)
         // showWindow makes the panel key; orderFront alone leaves copying in the source app.
         sticky.window?.orderFrontRegardless()
         let capture = Task { @MainActor in try await selection() }
@@ -600,6 +612,18 @@ import CryptoKit
                     statusItem.menu?.items.contains(where: { $0.title == "🤖 Assistant    ⌃⌥5" }) == true &&
                     note.model.availablePresets.contains(where: { $0.id == Preset.defaults[4].id && $0.name == "🤖 Assistant" })
             }
+            let translationDirectInput = "settings.preset.\(Preset.defaults[0].id).directInput"
+            let assistantDirectInput = "settings.preset.\(Preset.defaults[4].id).directInput"
+            checks["englishDirectInputSwitchesRendered"] = await waitFor {
+                label(preview, translationDirectInput) == "Direct Input for 🌐 Translate" &&
+                    label(preview, assistantDirectInput) == "Direct Input for 🤖 Assistant"
+            }
+            checks["nativeDirectInputDefaults"] = !isolatedStore.configuration.presets[0].directInput &&
+                isolatedStore.configuration.presets[4].directInput
+            _ = press(translationDirectInput)
+            checks["nativeDirectInputSwitchSavesOnlySelectedPreset"] = await waitFor {
+                isolatedStore.configuration.presets[0].directInput && isolatedStore.configuration.presets[4].directInput
+            }
             snapshot(preview, name: "settings-presets-en.png", includeFrame: true)
             let previousCount = editor.draft.presets.count
             _ = press("settings.preset.add")
@@ -645,7 +669,11 @@ import CryptoKit
             checks["menuAndExistingNoteSwitchBack"] = statusItem.menu?.items.contains(where: { $0.title == "设置…" }) == true &&
                 note.model.displayedPresetName == "📝 总结" && note.model.displayedState == "已完成"
             _ = press("settings.section.presets")
-            _ = await waitFor { accessibilityElement(in: preview, identifier: "settings.preset.restore") != nil }
+            checks["chineseDirectInputSwitchesPreserveSavedValues"] = await waitFor {
+                label(preview, translationDirectInput) == "🌐 翻译的直接输入" &&
+                    label(preview, assistantDirectInput) == "🤖 助手的直接输入" &&
+                    isolatedStore.configuration.presets[0].directInput && isolatedStore.configuration.presets[4].directInput
+            }
             snapshot(preview, name: "settings-presets-zh.png", includeFrame: true)
             let productionController = LoginItemService.controller()
             let realStatus = productionController.status
@@ -753,7 +781,7 @@ import CryptoKit
             diagnostics["nativeKeyDownCount"] = nativeKeyDownCount
             diagnostics["nativeKeyUpCount"] = nativeKeyUpCount
             report["diagnostics"] = diagnostics
-            report["scope"] = "Packaged application, nonactivating panel selection, separate frontmost fixture, posted physical key events, Carbon handler, new note with simulated model start; no API or user data writes."
+            report["scope"] = "Packaged application, nonactivating panel selection and direct input, separate frontmost fixture, posted physical key events, Carbon handler, simulated model start. No API or user data writes."
             if let problem { report["error"] = problem }
             if let data = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]) {
                 try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
@@ -809,11 +837,15 @@ import CryptoKit
             var child: StickyWindow?
             var failure: String?
             var eventCount = 0
+            var credentialReads = 0
             var probe = Preset.defaults[1]
             probe.shortcut = .init(keyCode: 25, modifiers: UInt32(cmdKey | controlKey | optionKey | shiftKey), label: "Test ⌃⌥⇧⌘9")
             hotKeys.onTrigger = { preset in
                 eventCount += 1
-                self.beginTrigger(preset, readKey: { "local-fixture-key" }, start: { note, _, _ in
+                self.beginTrigger(preset, readKey: {
+                    credentialReads += 1
+                    return "local-fixture-key"
+                }, start: { note, _, _ in
                     child = note; note.model.output = "链式处理已启动"
                 }, failure: { failure = $0 })
             }
@@ -867,6 +899,35 @@ import CryptoKit
                 checks["foreignAppStaysFrontmostAfterChaining"] = NSWorkspace.shared.frontmostApplication?.processIdentifier == fixture.processIdentifier
                 diagnostics["carbonCountAfterEmptySelection"] = eventCount
                 diagnostics["emptyTriggerFailure"] = failure
+
+                probe.directInput = true
+                try hotKeys.register([probe])
+                window.makeKeyAndOrderFront(nil); window.makeFirstResponder(textView)
+                textView.setSelectedRange((textView.renderedText as NSString).range(of: selected))
+                _ = await waitFor { textView.selectedText == selected }
+                checks["sourceHasSelectionBeforeDirectInput"] = (try? await sticky.selectedOutputTextSnapshot()) == selected
+                let readsBeforeDirectInput = credentialReads
+                await postShortcut()
+                _ = await waitFor { eventCount >= 3 }
+                let direct = stickies.values.first { $0.model.awaitingInput }
+                checks["directInputHotkeyOpensBlankNoteWithoutProcessingSelection"] = eventCount == 3 && failure == nil && child == nil &&
+                    direct?.model.preset.id == probe.id && direct?.model.source.isEmpty == true && direct?.model.draft.isEmpty == true &&
+                    direct?.model.capturingSelection == false && credentialReads == readsBeforeDirectInput
+                if let direct {
+                    checks["directInputFocusesNativeEditorWithoutActivatingApp"] = await waitFor {
+                        direct.window?.isKeyWindow == true &&
+                            (direct.window?.firstResponder as? NSTextView)?.accessibilityIdentifier() == "sticky.input" &&
+                            NSWorkspace.shared.frontmostApplication?.processIdentifier == fixture.processIdentifier
+                    }
+                    snapshot(direct.window, name: "direct-input-note.png")
+                    let question = "直接输入的问题？"
+                    let editor = direct.window?.firstResponder as? NSTextView
+                    editor?.insertText(question, replacementRange: NSRange(location: NSNotFound, length: 0))
+                    checks["directInputWaitsForSubmit"] = direct.model.draft == question && child == nil && credentialReads == readsBeforeDirectInput
+                    direct.model.submit?()
+                    checks["directInputSubmitsOnlyTypedText"] = child === direct && child?.model.source == question &&
+                        credentialReads == readsBeforeDirectInput + 1
+                }
             } catch { problem = error.localizedDescription }
             finish()
         }

@@ -18,17 +18,21 @@ public struct Preset: Codable, Identifiable, Equatable {
     public var shortcut: Shortcut
     /// Retains a default preset's identity even after its name, prompt, or shortcut is edited.
     public var builtIn: BuiltIn?
-    public init(id: UUID = UUID(), name: String, prompt: String, shortcut: Shortcut, builtIn: BuiltIn? = nil) {
+    public var directInput: Bool
+    public init(id: UUID = UUID(), name: String, prompt: String, shortcut: Shortcut, builtIn: BuiltIn? = nil,
+                directInput: Bool? = nil) {
         self.id = id; self.name = name; self.prompt = prompt; self.shortcut = shortcut; self.builtIn = builtIn
+        self.directInput = directInput ?? (builtIn == .assistant)
     }
-    private enum CodingKeys: String, CodingKey { case id, name, prompt, shortcut, builtIn }
+    private enum CodingKeys: String, CodingKey { case id, name, prompt, shortcut, builtIn, directInput }
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
-        id = try values.decode(UUID.self, forKey: .id)
-        name = try values.decode(String.self, forKey: .name)
-        prompt = try values.decode(String.self, forKey: .prompt)
-        shortcut = try values.decode(Shortcut.self, forKey: .shortcut)
-        builtIn = try values.decodeIfPresent(BuiltIn.self, forKey: .builtIn)
+        try self.init(id: values.decode(UUID.self, forKey: .id),
+                      name: values.decode(String.self, forKey: .name),
+                      prompt: values.decode(String.self, forKey: .prompt),
+                      shortcut: values.decode(Shortcut.self, forKey: .shortcut),
+                      builtIn: values.decodeIfPresent(BuiltIn.self, forKey: .builtIn),
+                      directInput: values.decodeIfPresent(Bool.self, forKey: .directInput))
     }
     public static let defaults: [Preset] = defaults(for: .simplifiedChinese)
 
